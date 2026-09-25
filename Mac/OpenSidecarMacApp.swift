@@ -37,15 +37,27 @@ struct OpenSidecarMacApp: App {
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    // Sparkle's standard updater. `startingUpdater: true` boots the updater
-    // immediately so scheduled background checks (SUEnableAutomaticChecks)
-    // run; the menu item drives manual "Check for Updates…". Held for the
-    // app's lifetime here so every window (menu bar + control window) shares
-    // one updater instance.
+    // Sparkle's standard updater, held for the app's lifetime so every window
+    // (menu bar + control window) shares one instance.
+    //
+    // alfheim fork: `startingUpdater: false`. There is no appcast published
+    // for this fork's bundle id, and the SUFeedURL inherited from upstream
+    // advertises the *stock* app — letting Sparkle run would eventually offer
+    // to replace this build with upstream 1.19.0 and undo the whole branch.
+    // Not starting the updater is the smallest possible disable: no scheduled
+    // check, no network traffic, and `canCheckForUpdates` stays false so the
+    // "Check for Updates…" menu item disables itself instead of doing
+    // something surprising. Nothing else in the app is touched, and flipping
+    // this back to `true` is all it takes to re-enable updates if the fork
+    // ever publishes its own appcast.
     let updater = SPUStandardUpdaterController(
-        startingUpdater: true, updaterDelegate: nil, userDriverDelegate: nil)
+        startingUpdater: false, updaterDelegate: nil, userDriverDelegate: nil)
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // Undo a speaker mute left behind by a previous run that crashed or
+        // was force-quit. Before anything else: a user who relaunches because
+        // "the Mac went silent" should get their sound back immediately.
+        SpeakerMuteController.shared.recoverFromPreviousRun()
         // Hand the updater to the control window, which is built outside the
         // SwiftUI App scene (NSHostingView), so it can offer the same button.
         MainWindow.updater = updater
@@ -54,6 +66,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if presentation != .menuBar {
             MainWindow.show()
         }
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        // Ordinary quit: put the speakers back before the process goes away,
+        // so the breadcrumb path never has to run.
+        SpeakerMuteController.shared.releaseForShutdown()
     }
 
     // Background/Dock modes: opening the app again (Spotlight, Finder, Dock
@@ -122,6 +140,10 @@ final class DeviceSession: ObservableObject, Identifiable {
     @Published var status = "Starting…"
     @Published var framesSent = 0
     @Published var mbps = 0.0
+    /// What adaptive quality has the stream at right now. Level 0 (full) is the
+    /// steady state and is not shown; anything else is, because a user looking
+    /// at a softer picture deserves to be told why.
+    @Published var qualityLevel = QualityLevel.unconstrained
     // The sender's start() threw: the pipeline is freed, only this row's
     // error text remains. A failed session must never swallow a fresh
     // connect for its device the way a live one does.
@@ -149,6 +171,15 @@ final class DeviceSession: ObservableObject, Identifiable {
     // The live TCP path runs over a cable (Thunderbolt Bridge / Ethernet)
     // rather than WiFi — reported by the sender once connected.
     @Published var wired = false
+
+    // Whether the sender's socket is up right now. A session that exists is
+    // not a session that is serving anybody: see `SessionSnapshot.connected`.
+    @Published var connected = false
+
+    // Whether the receiver can actually accept this session's audio frames:
+    // socket up AND tagged-framing hello received. This is intentionally not
+    // derived from the existence of the session or from `connected` alone.
+    @Published var audioDeliveryActive = false
 
     var transportLabel: String { onUSB ? "USB" : wired ? "Cable" : "WiFi" }
 
@@ -188,10 +219,135 @@ final class SenderController: ObservableObject {
     // (debugging escape hatch, e.g. an iproxy or SSH tunnel).
     @Published var host = UserDefaults.standard.string(forKey: "host") ?? "127.0.0.1"
     @Published var port = UserDefaults.standard.string(forKey: "port") ?? "9000"
-    // `-mode mirror` / `-mode extend` launch argument also works.
-    @Published var mode = CaptureMode(rawValue: UserDefaults.standard.string(forKey: "mode") ?? "") ?? .extend
+    /// What a session does to the desktop. **`remote` by default in this
+    /// fork**; the legacy `mode` key (and the `-mode mirror` / `-mode extend`
+    /// launch argument) still decides when `sessionLayout` is absent — see
+    /// `SessionLayout.resolve`.
+    @Published var sessionLayout = SessionLayout.resolved().layout {
+        didSet {
+            UserDefaults.standard.set(sessionLayout.rawValue, forKey: SessionLayout.defaultsKey)
+            // Choosing in the picker writes the new key, so from here on the
+            // answer came from the user, not from a default.
+            sessionLayoutSource = .sessionLayoutKey
+        }
+    }
+    /// Which key the live `sessionLayout` came from, carried into every session
+    /// so the capture-start log line can say *why* — see `SessionLayout.Source`.
+    private(set) var sessionLayoutSource = SessionLayout.resolved().source
+    /// Which display the capture pipeline points at. Derived from the layout,
+    /// so there is exactly one setting and the two can never disagree.
+    var mode: CaptureMode { sessionLayout.captureMode }
     @Published var quality = StreamQuality(rawValue: UserDefaults.standard.string(forKey: "quality") ?? "") ?? .best {
         didSet { UserDefaults.standard.set(quality.rawValue, forKey: "quality") }
+    }
+    // Which Option key on the device's hardware keyboard arrives as Command.
+    // Read by the injector when a session is built, so a change here applies
+    // to the next session — see CommandKeyRemap. The initial value goes
+    // through `fromDefaults()` so the legacy `remapRightOptionToCommand`
+    // boolean still decides what the picker shows on first launch.
+    @Published var commandKeyRemap = CommandKeyRemap.fromDefaults() {
+        didSet {
+            UserDefaults.standard.set(commandKeyRemap.rawValue,
+                                      forKey: CommandKeyRemap.defaultsKey)
+        }
+    }
+    // The keys an iPad Magic Keyboard does not have. Same contract as
+    // `commandKeyRemap`: read when the injector is built, so a change applies
+    // to the next session. See `KeyRemapPlan` for why `escapeKey` outranks
+    // `globeKey` when both name the Globe key.
+    @Published var escapeKey = EscapeKeySource.fromDefaults() {
+        didSet { UserDefaults.standard.set(escapeKey.rawValue, forKey: EscapeKeySource.defaultsKey) }
+    }
+    @Published var globeKey = GlobeKeyAction.fromDefaults() {
+        didSet { UserDefaults.standard.set(globeKey.rawValue, forKey: GlobeKeyAction.defaultsKey) }
+    }
+    @Published var languageKey = LanguageKeySource.fromDefaults() {
+        didSet { UserDefaults.standard.set(languageKey.rawValue, forKey: LanguageKeySource.defaultsKey) }
+    }
+    /// Nil unless two of the three settings above name the same key.
+    var keyRemapConflict: String? {
+        KeyRemapPlan.resolve(escapeKey: escapeKey, globeKey: globeKey,
+                             languageKey: languageKey).conflictNote
+    }
+    /// Stream system audio alongside the picture. **On by default in this
+    /// fork** — see `AudioPolicy.resolveStreamAudio`. Changing it restarts
+    /// capture, because `capturesAudio` is fixed at stream creation.
+    @Published var audioEnabled = AudioPolicy.streamAudioEnabled {
+        didSet {
+            UserDefaults.standard.set(audioEnabled, forKey: AudioPolicy.streamAudioKey)
+            updateSpeakerMute()
+        }
+    }
+    /// Mute this Mac's own speakers for as long as audio is being streamed.
+    /// Off by default; restored on session end, on quit, and — via a
+    /// breadcrumb — at the next launch after a crash. See
+    /// `SpeakerMuteController`.
+    @Published var muteMacSpeakers = AudioPolicy.muteSpeakersWhileStreaming {
+        didSet {
+            UserDefaults.standard.set(muteMacSpeakers, forKey: AudioPolicy.muteSpeakersKey)
+            updateSpeakerMute()
+        }
+    }
+
+    /// What the "Mute Mac speakers" row says underneath itself. The honest
+    /// version: a crash cannot be undone instantly, only at the next launch.
+    var speakerMuteHint: String {
+        let strategy = SpeakerMuteController.shared.strategy
+        guard strategy.isAvailable else {
+            return "Unavailable: this Mac's current output device exposes neither a mute switch nor a volume that software can set. Change the output device in Sound settings, or leave this off."
+        }
+        let how: String
+        switch strategy {
+        case .masterMute:
+            how = "mutes the output device"
+        case .channelMute(let channels):
+            how = "mutes all \(channels.count) output channels (this device has no master mute)"
+        case .masterVolume:
+            how = "turns the output volume down to zero (this device has no mute switch) and puts your level back afterwards"
+        case .channelVolume(let channels):
+            how = "turns all \(channels.count) output channels down to zero (this device has neither a mute switch nor a master volume) and puts your levels back afterwards"
+        case .unavailable:
+            how = ""
+        }
+        return "Silences this Mac's own output while a device is receiving the audio: \(how). Restored when the session ends, when the app quits, and — if it is force-quit or crashes — at its next launch. Follows the default output device if you change it mid-session."
+    }
+
+    /// Bring host silence in line with the settings and actual audio delivery.
+    /// A persistent waiting/reconnecting session does not count; only the
+    /// sender's audio gate does. `SpeakerMuteController` follows the current
+    /// default output device, so this is interface-agnostic (built-in, display,
+    /// USB, Thunderbolt, aggregate, and future devices all take this path).
+    func updateSpeakerMute() {
+        SpeakerMuteController.shared.apply(optionEnabled: muteMacSpeakers,
+                                           audioStreaming: audioEnabled,
+                                           audioDeliveryActive:
+                                               sessions.contains(where: \.audioDeliveryActive))
+    }
+
+    /// Target frame rate for the virtual display, the capture stream and the
+    /// encoder. **120 by default in this fork** — the panel it drives is an
+    /// iPad Pro 11 M1, i.e. ProMotion. See `FrameRate`.
+    @Published var frameRate = FrameRate.fromDefaults() {
+        didSet { UserDefaults.standard.set(frameRate.rawValue, forKey: FrameRate.defaultsKey) }
+    }
+
+    /// Step the bitrate (and, last, the frame rate) down when the link cannot
+    /// carry what the settings ask for. **On by default** — see
+    /// `AdaptiveQualityController`. Read when a sender is built, like the
+    /// layout and the frame rate, so it applies to the next session.
+    @Published var adaptiveQuality = AdaptiveQualityController.isEnabled {
+        didSet {
+            UserDefaults.standard.set(adaptiveQuality, forKey: AdaptiveQualityController.defaultsKey)
+        }
+    }
+
+    /// Move the open windows onto the session display in `remote` layout.
+    /// **On by default** — see `WindowGatherPolicy`. Read when a session
+    /// starts, so it applies to the next one.
+    @Published var gatherWindows = WindowGatherPolicy.enabled() {
+        didSet {
+            UserDefaults.standard.set(gatherWindows, forKey: WindowGatherPolicy.defaultsKey)
+        }
     }
 
     var running: Bool { !sessions.isEmpty }
@@ -224,6 +380,14 @@ final class SenderController: ObservableObject {
     // same hardware is recognized across transports even when the user
     // renamed the advertised service. @Published so the device list regroups
     // the moment an identity is learned.
+    /// The receiver install id the `-host`/`-port` endpoint last reached.
+    /// See `SessionDedupe.shouldDialManualEndpoint`.
+    private var manualEndpointInstallID: String? =
+        UserDefaults.standard.string(forKey: "manualEndpointInstallID") {
+        didSet {
+            UserDefaults.standard.set(manualEndpointInstallID, forKey: "manualEndpointInstallID")
+        }
+    }
     @Published private var installIDByUDID: [String: String] =
         UserDefaults.standard.dictionary(forKey: "installIDByUDID") as? [String: String] ?? [:] {
         didSet { UserDefaults.standard.set(installIDByUDID, forKey: "installIDByUDID") }
@@ -238,6 +402,73 @@ final class SenderController: ObservableObject {
     // action to confirm, not auto-grab.
     private var wifiAutoConnectArmed = false
     private let wifiAutoConnectDeadline = Date().addingTimeInterval(12)
+
+    /// Receivers this Mac has already talked to over any transport, by install
+    /// id. The key to auto-connecting over Bonjour **at any time** instead of
+    /// only in the 12 s launch window above — see
+    /// `SessionDedupe.knownBonjourToDial`.
+    private var knownInstallIDs: Set<String> {
+        var ids = Set(installIDByUDID.values)
+        if let manualEndpointInstallID { ids.insert(manualEndpointInstallID) }
+        // A receiver first met over Bonjour counts too, once it has said hello.
+        for session in sessions {
+            if let id = session.deviceID { ids.insert(id) }
+        }
+        ids.formUnion(bonjourKnownInstallIDs)
+        ids.remove("")
+        return ids
+    }
+
+    /// Install ids learned over Bonjour, persisted so "already known" survives
+    /// a relaunch — which is the whole point on a LAN with no Tailscale and no
+    /// cable: after the first manual connect, every later launch dials by
+    /// itself.
+    private var bonjourKnownInstallIDs: Set<String> =
+        Set(UserDefaults.standard.stringArray(forKey: "bonjourKnownInstallIDs") ?? []) {
+        didSet {
+            UserDefaults.standard.set(Array(bonjourKnownInstallIDs), forKey: "bonjourKnownInstallIDs")
+        }
+    }
+
+    /// Bonjour service name → receiver install id, persisted.
+    ///
+    /// The fallback identity for a browse result that arrives without its TXT
+    /// record, which is common enough that it is the reason auto-connect never
+    /// fired. Weaker than the TXT id — rename the iPad and the pair is stale —
+    /// so it is consulted only when the TXT is absent, and only for a pair this
+    /// Mac has itself observed.
+    private var installIDByServiceName: [String: String] =
+        UserDefaults.standard.dictionary(forKey: "bonjourNameToInstallID") as? [String: String] ?? [:] {
+        didSet {
+            UserDefaults.standard.set(installIDByServiceName, forKey: "bonjourNameToInstallID")
+        }
+    }
+
+    /// The last Bonjour decision logged per service, so a browse event that
+    /// changes nothing does not repeat itself. Browse handlers fire on every
+    /// mDNS refresh.
+    private var loggedBonjourDecisions: [String: String] = [:]
+
+    /// Dial targets a receiver has refused, and until when (PROTOCOL.md 6.6).
+    private var rejectionBackoff = RejectionBackoff()
+
+    /// What the panel shows for a refused sender.
+    struct RejectionRow: Identifiable {
+        let id: String
+        let name: String
+        let until: Date
+        let reason: String
+
+        var message: String {
+            let seconds = max(0, Int(until.timeIntervalSinceNow.rounded(.up)))
+            let why = reason == RejectionMessage.reasonOtherMacSelected
+                ? "another Mac is selected on that device"
+                : reason
+            return "Refused: \(why) — retrying in \(seconds)s"
+        }
+    }
+
+    @Published private(set) var rejections: [RejectionRow] = []
 
     init() {
         startBrowsing()
@@ -332,8 +563,19 @@ final class SenderController: ObservableObject {
         dedupeSessions()
         // The -host/-port escape hatch is an explicit choice — dial it like
         // the wired devices (it joins them, not replaces them).
+        //
+        // ...unless the cable already covers the same receiver. Ending the
+        // duplicate in `dedupeSessions` is only half the fix: this runs on
+        // every hello, every browse event and every usbmux publish, and used to
+        // re-dial `usb:first` the instant it saw no session with that id —
+        // which turned a one-off collision into a ~2s ping-pong that lasted for
+        // as long as the cable was in.
         if UserDefaults.standard.object(forKey: "host") != nil,
-           !usbDisabled.contains("usb:first"), session(for: "usb:first") == nil {
+           !usbDisabled.contains("usb:first"),
+           SessionDedupe.shouldDialManualEndpoint(sessions: sessions.map(snapshot),
+                                                  attachedUDIDs: cableCoveringUDIDs,
+                                                  installIDByUDID: installIDByUDID,
+                                                  knownInstallID: manualEndpointInstallID) {
             connect(to: .usb(udid: nil))
         }
         for device in usbDevices {
@@ -346,6 +588,50 @@ final class SenderController: ObservableObject {
                 connect(to: .usb(udid: device.udid))
             }
         }
+        // Known receivers, over Bonjour, at ANY time — no launch deadline and
+        // no dependence on the service *name*. This is what makes the LAN work
+        // with Tailscale switched off: the iPad advertises `_opensidecar._tcp`
+        // with its install id in the TXT record, and an id this Mac has already
+        // driven is the same device however it is named today.
+        let candidates = discovered.map { result in
+            SessionDedupe.BonjourCandidate(sessionID: ConnectionTarget.wifi(result).sessionID,
+                                           txtID: txtID(of: result),
+                                           serviceName: serviceName(of: result))
+        }
+        // **Every** result gets a decision and a line, not just the ones that
+        // match. Round 6's log had nothing at all here, which made "the TXT was
+        // missing", "the id is not known" and "something else already serves
+        // it" indistinguishable — three different bugs behind one silence.
+        // Repeated only when the answer changes: browse handlers fire on every
+        // mDNS refresh.
+        let decisions = SessionDedupe.bonjourDecisions(
+            candidates: candidates,
+            sessions: sessions.map(snapshot),
+            knownInstallIDs: knownInstallIDs,
+            cabledUDIDs: cableCoveringUDIDs,
+            installIDByUDID: installIDByUDID,
+            manualEndpointInstallID: manualEndpointInstallID,
+            installIDByServiceName: installIDByServiceName)
+        var seenThisPass = Set<String>()
+        for decision in decisions {
+            seenThisPass.insert(decision.sessionID)
+            let line = decision.logLine
+            if loggedBonjourDecisions[decision.sessionID] != line {
+                loggedBonjourDecisions[decision.sessionID] = line
+                Log.info(line)
+            }
+            guard decision.dial,
+                  let result = discovered.first(where: {
+                      ConnectionTarget.wifi($0).sessionID == decision.sessionID
+                  }) else { continue }
+            connect(to: .wifi(result))
+        }
+        loggedBonjourDecisions = loggedBonjourDecisions.filter { seenThisPass.contains($0.key) }
+
+        // Unknown receivers keep the old rule, deliberately: a device that has
+        // never been connected appearing on the network is not consent, and the
+        // launch window is what keeps "a flatmate opened the app" from grabbing
+        // a display.
         guard wifiAutoConnectArmed, Date() < wifiAutoConnectDeadline else { return }
         for result in discovered {
             let target = ConnectionTarget.wifi(result)
@@ -391,6 +677,14 @@ final class SenderController: ObservableObject {
             session.wifiServiceName = serviceName(of: result)
             session.sender.switchTransport(to: .tcp(result.endpoint))
         }
+        // Re-arming the manual endpoint needs nothing here. `usbDevices` was
+        // updated by the watcher *before* this call, so the detached udid has
+        // already left `attachedUDIDs`, and the `autoConnect()` the watcher
+        // makes immediately after this sees an uncovered manual endpoint and
+        // dials it. Keyed on attachment rather than on a session existing
+        // precisely so this case needs no extra state to reset — a session
+        // that is still retrying the cable through its grace period must not
+        // keep the manual endpoint suppressed.
     }
 
     /// A quit receiver app loses its Bonjour advertisement within ~1s, far
@@ -424,30 +718,145 @@ final class SenderController: ObservableObject {
         }
     }
 
+    /// Record what a `hello` said about which physical receiver a session
+    /// reaches. Called from both `onHello` and the pre-display admission
+    /// check, whichever of the two lands first — writing the same values
+    /// twice costs nothing and guarantees the decision sees them.
+    private func learnIdentity(of session: DeviceSession, from info: PhoneInfo) {
+        session.deviceID = info.id
+        session.deviceKind = info.device
+        if case .usb(let udid?) = session.target, let installID = info.id {
+            installIDByUDID[udid] = installID
+        }
+        // Which receiver the manual endpoint actually reaches. Persisted,
+        // because the gate in `autoConnect()` has to answer before the
+        // manual session has said hello — on the launch after a session
+        // that ping-ponged, that is the whole question.
+        if case .usb(nil) = session.target, let installID = info.id {
+            manualEndpointInstallID = installID
+        }
+        // A receiver met over Bonjour is "known" from now on, across launches:
+        // that is what lets the next launch dial it without Tailscale, a cable
+        // or the 12 s window.
+        if case .wifi = session.target, let installID = info.id, !installID.isEmpty {
+            bonjourKnownInstallIDs.insert(installID)
+        }
+        // Remember the **name ↔ id pair**, whatever transport learned it, for
+        // the browse results whose TXT record never arrives. `NWBrowser.Result`
+        // hands out `.metadata == .none` often enough that keying auto-connect
+        // on the TXT id alone meant the LAN path silently never fired: the
+        // round-6 log has no `known receiver … on Bonjour` line at all, on a
+        // Mac whose `bonjourKnownInstallIDs` already held the right id.
+        if let installID = info.id, !installID.isEmpty,
+           let name = session.wifiServiceName ?? bonjourName(of: session) {
+            if installIDByServiceName[name] != installID {
+                installIDByServiceName[name] = installID
+                Log.info("bonjour: remembering service name \"\(name)\" as receiver \(installID)")
+            }
+        }
+    }
+
+    /// The Bonjour service name this session's target names, if it is a WiFi
+    /// target at all.
+    private func bonjourName(of session: DeviceSession) -> String? {
+        guard case .wifi(let result) = session.target else { return nil }
+        return serviceName(of: result)
+    }
+
+    /// Flatten a session to the identity facts `SessionDedupe` needs. Keeping
+    /// `NWBrowser.Result` out of the decision is what makes the decision
+    /// testable at all — it has no public initializer.
+    private func snapshot(_ session: DeviceSession) -> SessionSnapshot {
+        let kind: SessionSnapshot.Kind
+        switch session.target {
+        case .usb(let udid?):  kind = .usbDevice(udid: udid)
+        case .usb(nil):        kind = .manualEndpoint
+        case .wifi:            kind = .wifi
+        }
+        var txt: String?
+        var name: String?
+        if case .wifi(let result) = session.target {
+            txt = txtID(of: result)
+            name = serviceName(of: result)
+        }
+        return SessionSnapshot(id: session.id, kind: kind, failed: session.failed,
+                               installID: session.deviceID, txtID: txt,
+                               serviceName: name ?? session.wifiServiceName,
+                               connected: session.connected,
+                               // `usb:first` is usbmuxd's first attached device
+                               // unless `-host` was given, in which case it is
+                               // a plain TCP endpoint — a tunnel. The two are
+                               // the same `ConnectionTarget` and opposite ends
+                               // of the precedence order.
+                               manualEndpointIsTunnel:
+                                   UserDefaults.standard.object(forKey: "host") != nil)
+    }
+
+    /// Which devices are on the cable right now.
+    private var attachedUDIDs: Set<String> { Set(usbDevices.map(\.udid)) }
+
+    /// The cables this app will actually drive: attached, not opted out of
+    /// auto-connect, and not sitting on a session whose `start()` threw.
+    ///
+    /// The pre-emptive rules (`SessionDedupe.admits`,
+    /// `manualEndpointsCoveredByCable`, `shouldDialManualEndpoint`) let a cable
+    /// veto another transport *before* that transport has built anything, so
+    /// the veto has to come from a cable that is going to work. A device the
+    /// user disconnected, or one whose USB session failed to start, must not be
+    /// allowed to suppress the only endpoint that can still reach it.
+    private var cableCoveringUDIDs: Set<String> {
+        Set(usbDevices.map(\.udid).filter { udid in
+            if usbDisabled.contains("usb:\(udid)") { return false }
+            if let existing = session(for: "usb:\(udid)"), existing.failed { return false }
+            return true
+        })
+    }
+
     /// Safety net, not a feature: if identity was learned too late (old
     /// receiver, renamed service) and one physical device ended up with two
     /// sessions, the transports steal the receiver's single connection from
-    /// each other forever. Keep the cable, drop the WiFi twin.
+    /// each other forever. Keep the cable, drop the twin — WiFi *or* manual.
+    ///
+    /// The decision lives in `SessionDedupe`; what is left here is reading the
+    /// controller's state into snapshots and carrying out the verdict.
     private func dedupeSessions() {
-        // Failed sessions hold no pipeline: a USB corpse must never win the
-        // "keep the cable" rule against a working WiFi session.
-        let usbSessionIDs = Set(sessions.compactMap { s -> String? in
-            if case .usb = s.target, !s.failed { return s.deviceID }
-            return nil
-        })
         let cabledNames = Set(usbDevices.compactMap { device -> String? in
             guard let s = session(for: "usb:\(device.udid)"), !s.failed else { return nil }
             return device.name
         })
-        for s in sessions {
-            guard case .wifi(let result) = s.target else { continue }
-            let duplicate = (s.deviceID.map { usbSessionIDs.contains($0) } ?? false)
-                || (txtID(of: result).map { usbSessionIDs.contains($0) } ?? false)
-                || (serviceName(of: result).map { cabledNames.contains($0) } ?? false)
-            if duplicate {
-                Log.info("two sessions for one device — keeping the cable, dropping \(s.id)")
-                end(s)
-            }
+        // First, the rule that does not need the loser's hello: a manual
+        // endpoint whose receiver is on the cable. Persisted identity answers
+        // this at launch, so the session is ended while it is still waiting to
+        // be greeted — before `setupExtend` has created anything.
+        let early = SessionDedupe.manualEndpointsCoveredByCable(
+            sessions.map(snapshot),
+            cabledUDIDs: cableCoveringUDIDs,
+            installIDByUDID: installIDByUDID,
+            knownInstallID: manualEndpointInstallID)
+        for id in early {
+            guard let s = session(for: id) else { continue }
+            Log.info("the cable covers this receiver — dropping \(s.id) before it builds a display")
+            end(s)
+        }
+        // Then the mirror of the dial gate: a tunnel that is still dialing
+        // while Bonjour already reaches this receiver. It is always launched
+        // first (before any browse result exists), so without this it redials
+        // for the life of the process — the whole of the idle log, and a
+        // session row that never delivers anything.
+        let superseded = SessionDedupe.manualTunnelsCoveredByLAN(
+            sessions.map(snapshot), knownInstallID: manualEndpointInstallID)
+        for id in superseded {
+            guard let s = session(for: id) else { continue }
+            Log.info("Bonjour reaches this receiver — retiring the dialing tunnel \(s.id)")
+            end(s)
+        }
+        let doomed = SessionDedupe.duplicateSessionIDs(sessions.map(snapshot),
+                                                       cabledDeviceNames: cabledNames,
+                                                       attachedUDIDs: attachedUDIDs)
+        for id in doomed {
+            guard let s = session(for: id) else { continue }
+            Log.info("two sessions for one device — keeping the cable, dropping \(s.id)")
+            end(s)
         }
     }
 
@@ -467,6 +876,22 @@ final class SenderController: ObservableObject {
 
     func session(for id: String) -> DeviceSession? {
         sessions.first { $0.id == id }
+    }
+
+    /// Labels for the refusal rows. Kept beside the (pure) backoff rather than
+    /// inside it: the policy cares about deadlines, the panel cares about names.
+    private var rejectionNames: [String: String] = [:]
+    private var rejectionReasons: [String: String] = [:]
+
+    private func refreshRejectionRows() {
+        let now = Date()
+        rejectionBackoff.prune(at: now)
+        rejections = rejectionBackoff.suppressedIDs.compactMap { id in
+            guard let until = rejectionBackoff.deadline(id) else { return nil }
+            return RejectionRow(id: id, name: rejectionNames[id] ?? id, until: until,
+                                reason: rejectionReasons[id] ?? "")
+        }
+        .sorted { $0.name < $1.name }
     }
 
     /// Derive a stable, per-device display serial from the session identity.
@@ -490,6 +915,17 @@ final class SenderController: ObservableObject {
     func connect(to target: ConnectionTarget, userInitiated: Bool = false,
                  awaitingWake: Bool = false) {
         let id = target.sessionID
+        // The receiver refused this sender and asked for a delay (PROTOCOL.md
+        // 6.6). Honour it exactly: no dial, so no display, no encoder and no
+        // audio pipeline exist while the other Mac has the device. A deliberate
+        // click overrides — the user is allowed to change their mind, and the
+        // receiver will simply refuse again if they have not.
+        if rejectionBackoff.isSuppressed(id, at: Date()) {
+            guard userInitiated else { return }
+            Log.info("user asked for \(id) while it was backing off from a refusal — dialing anyway")
+            rejectionBackoff.clear(id)
+            refreshRejectionRows()
+        }
         if let existing = session(for: id) {
             // A failed session holds no pipeline — replace the corpse
             // instead of letting it swallow the fresh attempt.
@@ -540,8 +976,10 @@ final class SenderController: ObservableObject {
         }
 
         let name = label(for: target)
-        let sender = MacSender(transport: transport, name: name, mode: mode,
-                               quality: quality, displaySerial: Self.displaySerial(for: id),
+        let sender = MacSender(transport: transport, name: name, layout: sessionLayout,
+                               layoutSource: sessionLayoutSource,
+                               quality: quality, frameRate: frameRate,
+                               displaySerial: Self.displaySerial(for: id),
                                identityOffset: identityOffset(for: id),
                                awaitingWake: awaitingWake)
         let session = DeviceSession(id: id, target: target, name: name, sender: sender)
@@ -555,21 +993,57 @@ final class SenderController: ObservableObject {
             session.status = text
             Log.info("status[\(id)]: \(text)")
         }
+        sender.onConnectedChange = { [weak self, weak session] up in
+            guard let self, let session, session.connected != up else { return }
+            session.connected = up
+            // A `-host`/`-port` session that has just gone down stops
+            // suppressing the LAN dial of the same receiver — and one that has
+            // just come up starts. Either way the answer changed, so ask again
+            // rather than waiting for the next browse event.
+            self.autoConnect()
+        }
+        sender.onAudioDeliveryChange = { [weak self, weak session] active in
+            guard let self, let session, session.audioDeliveryActive != active else { return }
+            session.audioDeliveryActive = active
+            self.updateSpeakerMute()
+        }
         sender.onHello = { [weak self, weak session] info in
             guard let self, let session else { return }
-            session.deviceID = info.id
-            session.deviceKind = info.device
-            if case .usb(let udid?) = session.target, let installID = info.id {
-                self.installIDByUDID[udid] = installID
-            }
+            self.learnIdentity(of: session, from: info)
             self.dedupeSessions()
             // The learned identity may reveal that this WiFi session's device
             // is cabled — take the upgrade opportunity right away.
             self.autoConnect()
         }
+        // Asked on the FIRST hello only, before the sender has created a
+        // virtual display, an H.264 encoder or an audio encoder. Answering
+        // here rather than in `dedupeSessions` is the fix for the 20:25
+        // incident: the loser used to be dropped only *after* both sessions
+        // had a display and both were encoding audio.
+        sender.admitSession = { [weak self, weak session] info in
+            guard let self, let session else { return false }
+            // Record the identity first: the decision is about this very id,
+            // and `onHello` may not have run yet (it is a separate hop onto
+            // the main actor). Idempotent — both paths write the same values.
+            self.learnIdentity(of: session, from: info)
+            let others = self.sessions.filter { $0 !== session }.map(self.snapshot)
+            let admitted = SessionDedupe.admits(self.snapshot(session),
+                                                helloInstallID: info.id,
+                                                others: others,
+                                                cabledUDIDs: self.cableCoveringUDIDs,
+                                                installIDByUDID: self.installIDByUDID)
+            if !admitted {
+                Log.info("refusing \(session.id) at hello — the cable already covers receiver "
+                    + "\(info.id ?? "(unidentified)"); no display and no encoder will be created")
+            }
+            return admitted
+        }
         sender.onStats = { [weak session] frames, mbps in
             session?.framesSent = frames
             session?.mbps = mbps
+        }
+        sender.onQualityLevel = { [weak session] level in
+            session?.qualityLevel = level
         }
         sender.onDisconnected = { [weak self, weak session] in
             // Device unplugged / left the network and stayed gone: end this
@@ -611,6 +1085,32 @@ final class SenderController: ObservableObject {
         sender.onTransportPath = { [weak session] wired in
             session?.wired = wired
         }
+        sender.onRejectedByReceiver = { [weak self, weak session] ms, reason in
+            // The device is pointed at a different Mac. End this session
+            // outright rather than leaving it retrying: ending is what
+            // guarantees "no display, no encoder" for the backoff, and the row
+            // that replaces it says why and for how long.
+            guard let self, let session else { return }
+            let until = Date().addingTimeInterval(Double(ms) / 1000)
+            self.rejectionBackoff.note(session.id, until: until)
+            self.rejectionNames[session.id] = session.name
+            self.rejectionReasons[session.id] = reason
+            let target = session.target
+            let id = session.id
+            self.end(session)
+            self.refreshRejectionRows()
+            // Come back when it expires. Not a timer that has to be cancelled:
+            // `connect` re-checks the backoff, so an early wake is harmless and
+            // a late one just dials.
+            Task { @MainActor [weak self] in
+                try? await Task.sleep(for: .milliseconds(ms + 500))
+                guard let self else { return }
+                self.rejectionBackoff.prune(at: Date())
+                self.refreshRejectionRows()
+                Log.info("refusal backoff for \(id) expired — dialing again")
+                self.connect(to: target)
+            }
+        }
         sender.onPeerClosed = { [weak self, weak session] in
             // The receiver app quit — a deliberate goodbye, so no reconnect
             // waits around. Reopening the app is a fresh start handled by
@@ -620,11 +1120,20 @@ final class SenderController: ObservableObject {
             self.end(session)
         }
         sessions.append(session)
+        // A dialer row is not a live stream. Host silence begins only after
+        // `onAudioDeliveryChange(true)` proves the receiver can accept audio.
+        updateSpeakerMute()
         Task {
             do {
                 try await sender.start()
             } catch is CancellationError {
                 // stopped by the user while waiting — nothing to report
+            } catch is SessionSuperseded {
+                // Refused at its first hello because the cable already covers
+                // this receiver. Nothing was built, so there is nothing to
+                // report and nothing to retry: take the row away.
+                Log.info("session \(id) stood down — the cable serves this receiver")
+                self.end(session)
             } catch {
                 Log.info("sender failed to start: \(error)")
                 session.status = "Failed: \(error.localizedDescription)"
@@ -632,6 +1141,8 @@ final class SenderController: ObservableObject {
                 // would keep holding this device's serial, and a parked
                 // live-looking session would swallow every future connect.
                 session.failed = true
+                session.audioDeliveryActive = false
+                self.updateSpeakerMute()
                 sender.stop()
             }
         }
@@ -666,14 +1177,16 @@ final class SenderController: ObservableObject {
     private func end(_ session: DeviceSession) {
         session.sender.stop()
         sessions.removeAll { $0.id == session.id }
+        updateSpeakerMute()   // the last session leaving un-mutes the speakers
     }
 
-    /// Mode/quality apply per-pipeline at construction — rebuild every session.
+    /// Layout/quality apply per-pipeline at construction — rebuild every session.
     func restartAll() {
         guard running else { return }
         let targets = sessions.map(\.target)
         sessions.forEach { $0.sender.stop() }
         sessions.removeAll()
+        updateSpeakerMute()
         targets.forEach { connect(to: $0) }
         autoConnect()   // a rebuilt WiFi session may deserve its cable back
     }
@@ -851,6 +1364,20 @@ struct ContentView: View {
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
+                    ForEach(controller.rejections) { rejection in
+                        HStack(alignment: .firstTextBaseline) {
+                            Circle()
+                                .fill(.orange)
+                                .frame(width: 9, height: 9)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(rejection.name)
+                                Text(rejection.message)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                        }
+                    }
                     ForEach(controller.deviceEntries) { entry in
                         if let session = controller.session(for: entry) {
                             // Title from the entry, not the session: the
@@ -881,12 +1408,32 @@ struct ContentView: View {
                     }
                 }
 
-                Picker("Mode", selection: $controller.mode) {
-                    Text("Extend").tag(CaptureMode.extend)
-                    Text("Mirror").tag(CaptureMode.mirror)
+                VStack(alignment: .leading, spacing: 4) {
+                    Picker("Session layout", selection: $controller.sessionLayout) {
+                        ForEach(SessionLayout.allCases) { layout in
+                            Text(layout.label).tag(layout)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    .onChange(of: controller.sessionLayout) { controller.restartAll() }
+                    Text(controller.sessionLayout.hint)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
-                .pickerStyle(.segmented)
-                .onChange(of: controller.mode) { controller.restartAll() }
+
+                if controller.sessionLayout == .remote {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Toggle("Gather windows onto the session display",
+                               isOn: $controller.gatherWindows)
+                        Text("When the session starts, move the open windows from the "
+                             + "other displays onto this one, and put them back when it "
+                             + "ends. Unplugging a monitor does this automatically; a "
+                             + "virtual display cannot, because the other displays are "
+                             + "still connected.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
 
                 VStack(alignment: .leading, spacing: 4) {
                     Picker("Quality", selection: $controller.quality) {
@@ -896,6 +1443,92 @@ struct ContentView: View {
                     }
                     .onChange(of: controller.quality) { controller.restartAll() }
                     Text(controller.quality.explanation)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Picker("Command key", selection: $controller.commandKeyRemap) {
+                        ForEach(CommandKeyRemap.allCases, id: \.self) { remap in
+                            Text(remap.label).tag(remap)
+                        }
+                    }
+                    Text(controller.commandKeyRemap.hint)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                // The iPad Magic Keyboard has no Escape key and no function
+                // row. These three decide which of the keys it *does* have
+                // stand in — see `KeyRemapPlan`.
+                VStack(alignment: .leading, spacing: 4) {
+                    Picker("Escape key", selection: $controller.escapeKey) {
+                        ForEach(EscapeKeySource.allCases, id: \.self) { source in
+                            Text(source.label).tag(source)
+                        }
+                    }
+                    Text(controller.escapeKey.hint)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Picker("Globe key", selection: $controller.globeKey) {
+                        ForEach(GlobeKeyAction.allCases, id: \.self) { action in
+                            Text(action.label).tag(action)
+                        }
+                    }
+                    Text(controller.globeKey.hint)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Picker("Input-source key", selection: $controller.languageKey) {
+                        ForEach(LanguageKeySource.allCases, id: \.self) { source in
+                            Text(source.label).tag(source)
+                        }
+                    }
+                    Text(controller.languageKey.hint)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    if let conflict = controller.keyRemapConflict {
+                        Text(conflict)
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                    }
+                }
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Toggle("Stream audio", isOn: $controller.audioEnabled)
+                        .onChange(of: controller.audioEnabled) { controller.restartAll() }
+                    Text("Sends this Mac's audio to the connected device. Needs OpenDisplay 4 or newer on the receiving end; older devices keep showing the picture only.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+
+                    Toggle("Silence this Mac while streaming audio",
+                           isOn: $controller.muteMacSpeakers)
+                        .disabled(!controller.audioEnabled)
+                    Text(controller.speakerMuteHint)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Picker("Frame rate", selection: $controller.frameRate) {
+                        ForEach(FrameRate.allCases) { r in
+                            Text(r.label).tag(r)
+                        }
+                    }
+                    .onChange(of: controller.frameRate) { controller.restartAll() }
+                    Text(controller.frameRate.explanation)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Toggle("Adapt quality to the link", isOn: $controller.adaptiveQuality)
+                    Text("When the connection cannot carry the configured bitrate — an LTE hop, a busy WiFi — the stream aims at what the link actually delivers instead: a continuous target rate, cut hard the moment the send queue backs up or latency starts climbing, and raised 10% at a time after fifteen seconds of clean statistics. Below about 1 Mbps it also drops the frame rate (120 → 60 → 30). The virtual display never changes, so the desktop layout never moves. `defaults write com.peetzweg.opensidecar.mac.alfheim adaptiveFloorKbps 800` sets the lowest rate it may ask for; `adaptiveMaxLever scale` additionally lets it shrink the captured size below the lowest frame rate, which is off by default. Takes effect on the next session.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -1048,6 +1681,12 @@ struct SessionRow: View {
                     .lineLimit(2)
             }
             Spacer()
+            if session.qualityLevel.index > 0 {
+                Text(session.qualityLevel.label)
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .help("The link could not carry the configured bitrate, so the congestion controller lowered the frame rate and/or the captured size on top of the rate cut. It gives them back, one at a time, after fifteen seconds of clean statistics.")
+            }
             if session.mbps > 0 {
                 Text("\(String(format: "%.1f", session.mbps)) Mbit/s")
                     .font(.system(.caption, design: .monospaced))
@@ -1071,4 +1710,3 @@ struct SessionRow: View {
         }
     }
 }
-

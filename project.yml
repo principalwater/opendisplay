@@ -70,13 +70,33 @@ targets:
         # (used to sign the appcast in CI) and is never committed. Sparkle
         # verifies update signatures against this public key before installing.
         SUPublicEDKey: rYxlIePmwzi2bRo/qIsuY2TqTnQ34li2gQhJpGBiumw=
-        # Check for updates automatically in the background on a schedule.
-        SUEnableAutomaticChecks: true
+        # --- alfheim fork: auto-update off ---
+        # There is no appcast for this fork's identity, and the upstream feed
+        # above advertises the *stock* app: a background check would offer to
+        # replace the fork with upstream 1.19.0 and silently undo every feature
+        # in this branch. Turning scheduled checks off is half of the fix; the
+        # other half is `startingUpdater: false` in Mac/OpenSidecarMacApp.swift,
+        # which keeps Sparkle from running at all. The SUFeedURL and
+        # SUPublicEDKey keys stay so Sparkle still has a well-formed
+        # configuration if it is ever started again.
+        SUEnableAutomaticChecks: false
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.peetzweg.opensidecar.mac
-        PRODUCT_NAME: OpenDisplay
-        BUNDLE_DISPLAY_NAME: OpenDisplay
+        # --- alfheim fork identity ---
+        # Its own bundle id and product name so the fork coexists with the
+        # stock App Store / DMG builds instead of fighting them:
+        #   * TCC keys Screen Recording and Accessibility grants by bundle id
+        #     + code signature, so sharing an id would revoke the stock app's
+        #     permissions every time this binary is rebuilt;
+        #   * UserDefaults domain becomes com.peetzweg.opensidecar.mac.alfheim
+        #     (`defaults write com.peetzweg.opensidecar.mac.alfheim …`);
+        #   * Log.swift derives its folder from CFBundleName, i.e. PRODUCT_NAME,
+        #     so this build logs to ~/Library/Logs/OpenDisplay Alfheim;
+        #   * PRODUCT_NAME (not BUNDLE_DISPLAY_NAME) is what the permission
+        #     lists show, so the fork appears as its own row.
+        PRODUCT_BUNDLE_IDENTIFIER: com.peetzweg.opensidecar.mac.alfheim
+        PRODUCT_NAME: OpenDisplay Alfheim
+        BUNDLE_DISPLAY_NAME: OpenDisplay Alfheim
         SWIFT_OBJC_BRIDGING_HEADER: Mac/OpenSidecarMac-Bridging-Header.h
         ENABLE_HARDENED_RUNTIME: YES
         CODE_SIGN_ENTITLEMENTS: Mac/OpenSidecarMac.entitlements
@@ -90,9 +110,9 @@ targets:
         # lists show, so the Debug build must override it to appear as its
         # own row instead of a second, indistinguishable "OpenDisplay".
         Debug:
-          PRODUCT_BUNDLE_IDENTIFIER: com.peetzweg.opensidecar.mac.debug
-          PRODUCT_NAME: OpenDisplay Dev
-          BUNDLE_DISPLAY_NAME: OpenDisplay Dev
+          PRODUCT_BUNDLE_IDENTIFIER: com.peetzweg.opensidecar.mac.alfheim.debug
+          PRODUCT_NAME: OpenDisplay Alfheim Dev
+          BUNDLE_DISPLAY_NAME: OpenDisplay Alfheim Dev
           # Colour-inverted icon so the dev build is obvious in the Dock,
           # cmd-tab and permission lists.
           ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon-Dev
@@ -151,12 +171,41 @@ targets:
     sources:
       - MacTests
       - Mac/DisplayArrangement.swift
-      - Mac/StreamConfiguration.swift
-      - Mac/VirtualCanvasSizing.swift
+      - Mac/FrameRate.swift
+      - Mac/InputInjector.swift
+      - Mac/KeyboardMap.swift
+      - Mac/KeyRemapPlan.swift
+      - Mac/InputSource.swift
+      - Mac/KeyRepeat.swift
       - Mac/Log.swift
       - Mac/LogPolicies.swift
       - Shared/Protocol.swift
       - Shared/LogSnapshot.swift
+      - Shared/Protocol.swift
+      - Shared/FrameCodec.swift
+      - Shared/AudioPacket.swift
+      - Shared/AudioJitterBuffer.swift
+      # The player itself, for the graph invariant: exactly one AVAudioPlayerNode
+      # with exactly one connection point, asserted against a real AVAudioEngine
+      # (AudioGraphTests). No audio device is needed — the graph exists before
+      # anything is started.
+      - Shared/AudioPlayer.swift
+      - Mac/AudioPolicy.swift
+      - Mac/AdaptiveQuality.swift
+      # The pure halves of the virtual-display lifetime: the HiDPI enforcement
+      # state machine and the registry that owns every CGVirtualDisplay. Neither
+      # touches CoreGraphics, so the release path is testable without a display.
+      - Mac/DisplayLifecycle.swift
+      - Mac/VideoSendQueue.swift
+      - Shared/StatsChannel.swift
+      - Mac/SessionDedupe.swift
+      # Pure: how often a dial that cannot reach its receiver may say so.
+      - Mac/RedialLog.swift
+      - Mac/SessionLayout.swift
+      - Mac/WindowGather.swift
+      - Shared/SenderIdentity.swift
+      # Pure, UIKit-free: the Native-mode gesture decisions (iOS), tested here.
+      - iOS/NativeTouchPolicy.swift
     settings:
       base:
         # A hostless test bundle: the sources under test are compiled straight
@@ -170,22 +219,40 @@ targets:
   OpenSidecariOS:
     type: application
     platform: iOS
-    # iOS 15 is the lowest floor Xcode 27's SDK allows and the last stop that
-    # revives hardware (iPad Air 2, iPad mini 4, iPhone 6s/7/SE). See #72.
-    # Anything newer is used behind #available, never as a floor.
-    deploymentTarget: "15.0"
+    # Upstream lowered this to 15.0 in v1.21.0 to revive iPad Air 2 / mini 4 /
+    # iPhone 6s-era hardware (#72), using #available for anything newer. The
+    # fork ships to exactly one receiver — an iPad Pro 11 M1 on current
+    # iPadOS — and its UI uses iOS 16 API directly (LabeledContent), so the
+    # fork keeps its own floor instead of rewriting that behind #available.
+    deploymentTarget: "16.4"
     sources:
       - iOS
       - Shared
     info:
       path: iOS/Info.plist
       properties:
-        CFBundleDisplayName: OpenDisplay
+        # alfheim fork: own display name so it is distinguishable from the
+        # App Store build on the same iPad's home screen.
+        CFBundleDisplayName: OpenDisplay Alfheim
         CFBundleIconName: AppIcon
         CFBundleShortVersionString: "$(MARKETING_VERSION)"
         CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
         UILaunchScreen: {}
         UIRequiresFullScreen: true
+        # ProMotion. Since iOS 15 a third-party app is held to a 60 Hz minimum
+        # frame duration unless it declares this key — Apple's "Optimizing
+        # ProMotion Refresh Rates for iPhone 13 Pro and iPad Pro" is the
+        # reference, and despite the "OnPhone" spelling it is the documented
+        # opt-in for the whole high-refresh behaviour. Declaring it on a
+        # 60 Hz device changes nothing, so there is no downside to setting it
+        # unconditionally.
+        #
+        # Without it the CAMetalLayer path (and Core Animation generally)
+        # presents at most 60 times a second, which would silently throw away
+        # half of a 120 fps stream at the last step of the pipeline. Verify on
+        # the device with the performance overlay's FPS readout and the
+        # `panel: …Hz max` line this app logs at startup.
+        CADisableMinimumFrameDurationOnPhone: true
         NSLocalNetworkUsageDescription: OpenDisplay advertises itself on the local network so your Mac can connect over WiFi.
         NSBonjourServices: ["_opensidecar._tcp"]
         UISupportedInterfaceOrientations:
@@ -195,6 +262,9 @@ targets:
           - UIInterfaceOrientationPortraitUpsideDown
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.peetzweg.opensidecar.ios
+        # alfheim fork: own bundle id, so this installs alongside the stock
+        # App Store receiver rather than replacing it. The stock app stays
+        # available as the fallback for the live production session.
+        PRODUCT_BUNDLE_IDENTIFIER: com.peetzweg.opensidecar.ios.alfheim
         TARGETED_DEVICE_FAMILY: "1,2"
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon

@@ -5,9 +5,12 @@
 set -e
 cd "$(dirname "$0")"
 
-APP="build/Build/Products/Debug/OpenDisplay Dev.app"
-if [[ ! -d "$APP" ]]; then
-  echo "Mac app not built — run: xcodegen generate && xcodebuild -project OpenSidecar.xcodeproj -scheme OpenSidecarMac -configuration Debug -derivedDataPath build build"
+# alfheim fork: Debug builds are named "OpenDisplay Alfheim Dev" (own bundle
+# ID and TCC identity, so they never clobber either the stock app's or the
+# fork's Release permission grants).
+APP=build/Build/Products/Debug/OpenDisplay\ Alfheim\ Dev.app
+if [[ ! -d $APP ]]; then
+  echo "Mac app not built — run: ./generate.sh && xcodebuild -project OpenSidecar.xcodeproj -scheme OpenSidecarMac -configuration Debug -derivedDataPath build build"
   exit 1
 fi
 
@@ -27,4 +30,4 @@ if codesign -dv "$APP" 2>&1 | grep -q 'Signature=adhoc' \
 fi
 
 open "$APP"
-echo "OpenDisplay Dev running — logs at ~/Library/Logs/OpenDisplay Dev/opendisplay.log."
+echo "OpenDisplay Alfheim Dev running — logs at ~/Library/Logs/OpenDisplay Alfheim Dev/opendisplay.log."

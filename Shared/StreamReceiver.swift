@@ -51,6 +51,18 @@ struct PerfStats: Equatable {
     var decodeP50 = 0.0          // VTDecompressionSession decode, ms
     var photonP50 = 0.0          // Mac capture → frame actually on glass, ms
     var photonP95 = 0.0
+    // Audio, measured on the same clock as e2eP50 above (Mac capture →
+    // arrival here, via the ping/pong offset), so the two are comparable.
+    var audioE2eP50 = 0.0
+    // Audio latency minus video latency. Positive = audio is behind the
+    // picture, negative = ahead. This is the number that says whether the two
+    // are in sync; the individual latencies only say how far behind live
+    // everything is.
+    var avSkewMs = 0.0
+    var audioDepth = 0           // jitter buffer occupancy, packets
+    var audioTarget = 0          // pre-roll depth; grows if the link underruns
+    var audioUnderruns = 0       // buffer ran dry (this report)
+    var audioDrops = 0           // packets dropped at capacity (this report)
 }
 
 // MARK: - Peer-driven update signals (issue #132)
@@ -80,7 +92,121 @@ final class StreamReceiver: ObservableObject {
 
     private var listener: NWListener?
     private var listenerHealthy = false
+    /// A rebind waiting for the previous listener to release the port.
+    ///
+    /// `NWListener.cancel()` is **asynchronous**: the socket is closed when the
+    /// listener reaches `.cancelled`, which is delivered later on this queue.
+    /// Round 5 cancelled and rebound in the same turn, and iOS answered with
+    /// `POSIXErrorCode(48): Address already in use` on *every* restart — which
+    /// then scheduled another restart a second later, which failed the same
+    /// way. That loop is in the log four times over one evening.
+    /// `allowLocalEndpointReuse` does not help: it relaxes `SO_REUSEADDR`-style
+    /// rules for a socket in `TIME_WAIT`, not for one that is still open with a
+    /// live accept queue.
+    private var rebindPending = false
+    /// Consecutive listener failures, for the backoff. Reset on `.ready`.
+    private var listenerFailures = 0
+    private var cursorListenerFailures = 0
     private var connection: NWConnection?
+    /// Whether this connection's sender tags its frames (protocol 4+).
+    ///
+    /// Per-connection, and false until `welcome` says otherwise: our own
+    /// `hello` goes out before we know what the sender speaks, and its
+    /// `welcome` arrives as a legacy frame for the same reason. Reset when a
+    /// connection is adopted, so a session inherits nothing from the last one.
+    private var senderSpeaksTaggedFrames = false
+    /// Whether this connection's sender reads `stats` off the UDP cursor flow
+    /// (`welcome.statsUdp`, PROTOCOL.md 6.3). False until it says so, and reset
+    /// per connection like every other capability.
+    private var senderReadsStatsDatagrams = false
+    /// The `sq` on the next report. Per connection, starting at 1, so the
+    /// sender can tell one report's two copies from two reports.
+    private var statsSequence: UInt64 = 0
+    /// Logged once per connection, because "the stats are taking the fast lane"
+    /// is a fact worth one line and no more.
+    private var loggedStatsDatagramPath = false
+    /// Log-once guards: an unreadable frame kind repeats at frame rate, and a
+    /// per-frame log would bury the rest of the session's diagnostics.
+    private var loggedUnknownFrameType = false
+    private var loggedAudioFormat = false
+    private var loggedAudioMalformed = false
+    /// Audio arrival counters, reported alongside the video stats so the
+    /// audio path is visible in the same place as the rest of the pipeline.
+    private var audioPacketsThisWindow = 0
+    private var audioBytesThisWindow = 0
+    /// Per-packet audio latencies, same units and clock as `e2eWindow`.
+    private var audioE2eWindow: [Double] = []
+    /// Decode and playback for the audio channel. Created eagerly but idle
+    /// until packets arrive, so a session that never carries audio pays only
+    /// the allocation.
+    private let audioPlayer = AudioPlayer()
+
+    /// Silence audio without interrupting the stream. Published so the UI can
+    /// bind a toggle to it.
+    ///
+    /// Persisted (alfheim fork): playback is on by default here, so the only
+    /// way to say "I do not want the Mac's sound on this device" is this
+    /// switch, and a preference that forgot itself on every launch would not
+    /// be one. Key: `audioMuted`, absent = not muted = audio plays.
+    @Published var audioMuted = UserDefaults.standard.bool(forKey: "audioMuted") {
+        didSet {
+            guard oldValue != audioMuted else { return }
+            UserDefaults.standard.set(audioMuted, forKey: "audioMuted")
+            audioPlayer.isMuted = audioMuted
+            Log.info("audio: \(audioMuted ? "muted" : "unmuted") on this device")
+            // Re-assert readiness. Muting here is local — `player.volume`, so
+            // the hardware keeps pacing the buffer — and the Mac is never told
+            // about it, so in principle nothing needs re-sending. In practice
+            // "I unmuted and nothing happened" is the one moment a user will
+            // give us to notice that a sender's audio gate is shut for some
+            // *other* reason, and a `hello` is ~200 bytes. It costs one message
+            // per flick of a switch and re-runs the sender's whole handshake.
+            queue.async { [weak self] in
+                guard let self, let conn = self.connection, conn.state == .ready else { return }
+                self.sendHello(on: conn)
+            }
+        }
+    }
+    // MARK: - Which Mac (PROTOCOL.md 6.6)
+    //
+    // Senders dial; this receiver listens. With two Macs on one LAN and one
+    // tailnet, both running senders, whoever dialed first got the screen — so
+    // the arbitration has to live here, and the only thing it needs is to know
+    // who is calling. `welcome` now carries `host` and `senderID`.
+
+    /// Every sender that has introduced itself to this receiver, persisted so
+    /// the picker is populated before either Mac is running.
+    @Published private(set) var knownSenders: [SenderIdentity] =
+        SenderChoice.decode(UserDefaults.standard.array(forKey: SenderChoice.knownSendersKey)) {
+        didSet {
+            UserDefaults.standard.set(SenderChoice.encode(knownSenders),
+                                      forKey: SenderChoice.knownSendersKey)
+        }
+    }
+
+    /// Which Mac this device accepts. `SenderChoice.anyMac` (the empty string,
+    /// and the default) means the round-4 behaviour: first to dial wins.
+    @Published var preferredSenderID: String =
+        UserDefaults.standard.string(forKey: SenderChoice.preferredKey) ?? SenderChoice.anyMac {
+        didSet {
+            UserDefaults.standard.set(preferredSenderID, forKey: SenderChoice.preferredKey)
+        }
+    }
+
+    /// Whoever is connected right now, for the UI to name.
+    @Published private(set) var currentSender: SenderIdentity?
+
+    /// The preference, read from the connection's queue.
+    ///
+    /// Deliberately straight out of `UserDefaults` rather than off the
+    /// `@Published` property: `welcome` is handled on the network queue and the
+    /// published value is main-actor state. `UserDefaults` is thread-safe, and
+    /// the two can never disagree because the setter above writes it
+    /// synchronously.
+    private var preferredSenderIDForQueue: String {
+        UserDefaults.standard.string(forKey: SenderChoice.preferredKey) ?? SenderChoice.anyMac
+    }
+
     // Cursor side channel: UDP on port+1. Cursor positions ride TCP behind
     // multi-hundred-KB video frames, so over WiFi one late frame stalls the
     // cursor with it (head-of-line blocking). UDP datagrams skip that queue.
@@ -357,16 +483,74 @@ final class StreamReceiver: ObservableObject {
     /// or enterSleep deliberately took it down on lock).
     func ensureListening() {
         queue.async {
-            guard !self.listenerHealthy else { return }
-            Log.info("listener not healthy — restarting")
-            self.restartListener()
+            // **The cached flag is not the health check.** Round 5's was one
+            // `Bool`, and the listener's own `stateUpdateHandler` was installed
+            // with no identity guard — so a *retired* listener's `.cancelled`,
+            // delivered after the replacement had already gone `.ready`, set
+            // `listenerHealthy = false` on a perfectly good listener and the
+            // next foreground restarted it for no reason. Ask the object.
+            guard ListenerRestartPolicy.shouldRestart(listenerIsLive: self.listenerIsLive,
+                                                      rebindInFlight: self.rebindPending) else {
+                return
+            }
+            // **Never on a false positive, and never at the cost of a live
+            // session.** A restart cannot in itself hurt an adopted
+            // `NWConnection` — the connection is independent of the listener
+            // that accepted it — but the round-5 log has the restart storm and
+            // the session's death in the same second, and "the listener churns
+            // while a session is live" is not a state worth ever being in. So
+            // while a session is up the listener is left alone unless it is
+            // genuinely gone, and the line says which.
+            if let connection = self.connection, connection.state == .ready {
+                Log.info("listener is down while a session is live — rebinding "
+                         + "without touching the connection")
+            } else {
+                Log.info("listener not healthy — restarting")
+            }
+            self.restartListener(reason: "a health check found it down")
         }
+    }
+
+    /// Whether the listener object itself says it is accepting connections.
+    /// `listenerHealthy` mirrors the state callbacks; this reads the truth.
+    private var listenerIsLive: Bool {
+        guard let listener, listenerHealthy else { return false }
+        if case .ready = listener.state { return true }
+        return false
     }
 
     // Set while the app lingers in the background with the session alive
     // (brief app switch): decoding is pointless and hardware decode sessions
     // fail off-screen, so frames are dropped before the sample stage.
     private var renderingPaused = false
+
+    /// Rebuild the audio graph after an AVAudioSession interruption (a call,
+    /// Siri, another app seizing the session) or a route change.
+    ///
+    /// The engine survives an interruption as an object but stops producing
+    /// sound, and the packet path cannot tell — so without this one phone call
+    /// ends audio for the rest of the session while video carries on. The
+    /// receiver app hooks `AVAudioSession.interruptionNotification`.
+    func restartAudioEngine() {
+        audioPlayer.restartEngine()
+    }
+
+    /// The system took the audio session away (a call, Siri, another app, or
+    /// the app being suspended). Stop the engine rather than decoding into a
+    /// node that produces no sound: those buffers are scheduled and never
+    /// consumed, so nothing completes, the schedule ledger saturates, and
+    /// playback is deadlocked until something rebuilds the graph.
+    func suspendAudio() {
+        audioPlayer.stop()
+    }
+
+    /// The session came back. Idempotent with `suspendAudio`, and paired with
+    /// it one-for-one by the caller: a `.ended` with no `.began` rebuilds
+    /// nothing.
+    func resumeAudio() {
+        audioPlayer.restartEngine()
+        audioPlayer.start()
+    }
 
     /// Pause/resume the video sink around a background linger. Resuming
     /// flushes the layer and asks the Mac for a keyframe so the picture
@@ -376,6 +560,16 @@ final class StreamReceiver: ObservableObject {
             guard paused != self.renderingPaused else { return }
             self.renderingPaused = paused
             Log.info(paused ? "rendering paused (backgrounded)" : "rendering resumed")
+            // Audio follows video: this build claims no background audio mode,
+            // so continuing to play while backgrounded is not available to us
+            // anyway. Flushing on resume drops what buffered while hidden
+            // rather than replaying it late against a fresh picture.
+            if paused {
+                self.audioPlayer.stop()
+            } else {
+                self.audioPlayer.flush()
+                self.audioPlayer.start()
+            }
             if !paused {
                 self.displayLayer.flush()
                 if self.connection?.state == .ready {
@@ -418,6 +612,7 @@ final class StreamReceiver: ObservableObject {
                 self.listener = nil
                 self.listenerHealthy = false
                 self.stopCursorListener()
+                self.audioPlayer.stop()
                 self.setConnected(false)
                 self.setStatus(status)
                 completion?()
@@ -437,10 +632,102 @@ final class StreamReceiver: ObservableObject {
         }
     }
 
-    private func restartListener() {
-        listener?.cancel()
+    /// Refuse the live sender and close its connection (PROTOCOL.md 6.6).
+    ///
+    /// Not `closing` and not `sleeping`: both of those mean "this receiver is
+    /// going away", and a sender that reads them stops trying. This one means
+    /// "not you" and carries how long to wait, so the *other* Mac gets the
+    /// device and this one comes back by itself if the preference changes.
+    ///
+    /// The listener stays up throughout — the point of refusing is that another
+    /// sender can be accepted a moment later.
+    func reject(retryAfterMs: Int, reason: String) {
+        queue.async {
+            guard let conn = self.connection else { return }
+            var finished = false
+            let finish = { [weak self] in
+                guard let self, !finished else { return }
+                finished = true
+                if self.connection === conn {
+                    self.connection = nil
+                    self.setConnected(false)
+                    self.setStatus("Waiting for the Mac you chose…")
+                    DispatchQueue.main.async { self.currentSender = nil }
+                }
+                conn.cancel()
+            }
+            Log.info("rejecting the current sender (\(reason)), asking it to wait \(retryAfterMs) ms")
+            self.sendControl(RejectionMessage.payload(retryAfterMs: retryAfterMs, reason: reason),
+                             on: conn) {
+                self.queue.async { finish() }
+            }
+            // A send completion may never fire on a link that is already going:
+            // do not let that leave us adopted by a Mac we just refused.
+            self.queue.asyncAfter(deadline: .now() + 1) { finish() }
+        }
+    }
+
+    /// "Switch to…": set the preference and, if some other Mac is driving right
+    /// now, hand the device over.
+    ///
+    /// The backoff is short (`SenderChoice.switchRetryAfterMs`) on purpose:
+    /// this is a swap, not a ban. If the Mac the user just chose turns out not
+    /// to be running, the one they came from is back within seconds rather than
+    /// after the full refusal window.
+    func chooseSender(_ senderID: String) {
+        let previous = preferredSenderID
+        preferredSenderID = senderID
+        Log.info("connect-to preference set to "
+                 + (senderID.isEmpty ? "Any Mac" : senderID)
+                 + " (was " + (previous.isEmpty ? "Any Mac" : previous) + ")")
+        guard SenderChoice.shouldReject(preferred: senderID, senderID: currentSender?.id) else { return }
+        reject(retryAfterMs: SenderChoice.switchRetryAfterMs,
+               reason: RejectionMessage.reasonOtherMacSelected)
+    }
+
+    /// Drop a Mac from the remembered list (and from the preference, if it was
+    /// the chosen one — a preference nothing can satisfy is a receiver that
+    /// refuses everything).
+    func forgetSender(_ senderID: String) {
+        knownSenders.removeAll { $0.id == senderID }
+        preferredSenderID = SenderChoice.validate(preferred: preferredSenderID,
+                                                  against: knownSenders)
+    }
+
+    /// Take the listener down and bring it back — **after** the old one has
+    /// actually released the port.
+    ///
+    /// Coalescing matters as much as the wait: the round-5 storm had a failure
+    /// timer, a foreground health check and a retired listener's stale callback
+    /// all asking for a restart inside the same second, and each one cancelled
+    /// the listener the previous one had just created.
+    private func restartListener(reason: String) {
+        guard ListenerRestartPolicy.shouldRestart(listenerIsLive: false,
+                                                  rebindInFlight: rebindPending) else {
+            Log.info("listener rebind already in flight (\(reason)) — not starting a second")
+            return
+        }
+        rebindPending = true
+        guard let old = listener else {
+            completeRebind(because: reason)
+            return
+        }
         listener = nil
         listenerHealthy = false
+        old.cancel()
+        // `.cancelled` normally lands within milliseconds and rebinds us from
+        // the handler installed in `startListener`. The deadline is the belt to
+        // that brace: a rebind that never happens is a receiver nobody can
+        // reach, which is worse than one `EADDRINUSE` we then back off from.
+        queue.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+            self?.completeRebind(because: "the old listener took too long to cancel")
+        }
+    }
+
+    private func completeRebind(because reason: String) {
+        guard rebindPending else { return }
+        rebindPending = false
+        Log.info("rebinding the listener on :\(port) — \(reason)")
         startListener()
     }
 
@@ -448,6 +735,15 @@ final class StreamReceiver: ObservableObject {
     /// right after it, torn down with it. Losing it is never fatal; the
     /// sender falls back to TCP when hello carries no cursorPort.
     private func startCursorListener() {
+        // **Keep a working one.** `startListener` calls this every time the
+        // TCP listener is (re)bound, and the UDP socket has nothing to do with
+        // that: cancelling and rebinding 9001 in the same turn hits the same
+        // asynchronous-cancel wall as 9000 does, which is why the round-5 log
+        // has `cursor listener ready on udp :9001` twice inside 150 ms, around
+        // a TCP rebind that failed with `EADDRINUSE`.
+        if let existing = cursorListener, cursorListenerReady, case .ready = existing.state {
+            return
+        }
         stopCursorListener()
         let params = NWParameters.udp
         params.allowLocalEndpointReuse = true
@@ -457,7 +753,13 @@ final class StreamReceiver: ObservableObject {
         do {
             udp = try NWListener(using: params, on: NWEndpoint.Port(rawValue: cursorPort)!)
         } catch {
-            Log.info("cursor listener failed on udp :\(cursorPort): \(error) (cursor stays on TCP)")
+            cursorListenerFailures += 1
+            let delay = ListenerRestartPolicy.backoff(failures: cursorListenerFailures)
+            Log.info("cursor listener failed on udp :\(cursorPort): \(error) — "
+                     + "cursor stays on TCP, retrying in \(Int(delay))s")
+            queue.asyncAfter(deadline: .now() + delay) { [weak self] in
+                self?.startCursorListener()
+            }
             return
         }
         cursorListener = udp
@@ -484,6 +786,7 @@ final class StreamReceiver: ObservableObject {
             switch state {
             case .ready:
                 self.cursorListenerReady = true
+                self.cursorListenerFailures = 0
                 Log.info("cursor listener ready on udp :\(self.cursorPort)")
                 // hello may already be out without the port (the sender
                 // connected before UDP bound); re-send so it can switch.
@@ -491,13 +794,23 @@ final class StreamReceiver: ObservableObject {
                     self.sendHello(on: connection)
                 }
             case .failed(let error):
-                Log.info("cursor listener failed: \(error) (cursor stays on TCP)")
+                self.cursorListenerFailures += 1
+                let delay = ListenerRestartPolicy.backoff(failures: self.cursorListenerFailures)
+                Log.info("cursor listener failed: \(error) — cursor stays on TCP, "
+                         + "retrying in \(Int(delay))s")
                 let wasAnnounced = self.cursorPortAnnounced
                 self.stopCursorListener()
                 // Withdraw the offer: a hello without cursorPort makes the
                 // sender close its channel and return to TCP.
                 if wasAnnounced, let connection = self.connection, connection.state == .ready {
                     self.sendHello(on: connection)
+                }
+                // Round 5 gave up here for good, so one transient UDP failure
+                // moved the cursor onto the ~30 ms TCP path for the rest of
+                // the app's life — which reads as "the pointer is laggy today"
+                // and nothing in the log says why.
+                self.queue.asyncAfter(deadline: .now() + delay) { [weak self] in
+                    self?.startCursorListener()
                 }
             case .cancelled:
                 self.cursorListenerReady = false
@@ -552,6 +865,7 @@ final class StreamReceiver: ObservableObject {
     }
 
     private func startListener() {
+        let created: NWListener
         do {
             // noDelay matters most in THIS direction: touch events are tiny
             // packets, and Nagle would hold each one until the previous is
@@ -561,94 +875,201 @@ final class StreamReceiver: ObservableObject {
             let params = NWParameters(tls: nil, tcp: tcp)
             params.allowLocalEndpointReuse = true
             params.serviceClass = .interactiveVideo
-            listener = try NWListener(using: params, on: NWEndpoint.Port(rawValue: port)!)
+            created = try NWListener(using: params, on: NWEndpoint.Port(rawValue: port)!)
         } catch {
+            // Round 5 returned here and scheduled nothing, so a listener that
+            // could not even be constructed stayed down until the next
+            // foreground. Treat it like any other failure.
+            listenerFailures += 1
+            let delay = ListenerRestartPolicy.backoff(failures: listenerFailures)
+            Log.info("listener could not be created on :\(port): \(error) — "
+                     + "retrying in \(Int(delay))s (attempt \(listenerFailures))")
             setStatus("Listener failed: \(error.localizedDescription)")
+            queue.asyncAfter(deadline: .now() + delay) { [weak self] in
+                self?.restartListener(reason: "the listener could not be created")
+            }
             return
         }
+        listener = created
         // Advertise on the local network so the Mac can discover us for WiFi
         // mode (USB/usbmux connects straight to the port and ignores this).
-        listener?.service = advertisedService
-        listener?.newConnectionHandler = { [weak self] conn in
+        created.service = advertisedService
+        created.newConnectionHandler = { [weak self] conn in
             guard let self else { return }
             Log.info("new connection from \(String(describing: conn.endpoint))")
-            // usbmux-forwarded (cable) connections arrive from loopback;
-            // anything else came over the network.
             let peer = String(describing: conn.endpoint)
-            self.transport = (peer.hasPrefix("127.0.0.1") || peer.hasPrefix("::1")
-                              || peer.hasPrefix("localhost")) ? "USB" : "WiFi"
+            // **Nothing becomes the session until it proves it is a sender.**
+            //
             // A Bonjour dial races IPv6 and IPv4 and both handshakes can
             // complete; the sender cancels its loser within milliseconds.
             // Adopting every newcomer at once evicted the winner for a
-            // connection that was already dying (seen in the field as a
-            // reset-by-peer storm). With a connection in hand, a newcomer
-            // has to stay alive for a moment before it replaces it.
-            // A closed socket still reads as .ready until a receive hits
-            // EOF, so the proof is bytes: greet the newcomer and adopt it
-            // the moment it streams something back; a socket that closes
-            // or errors first is discarded and the session stays put.
-            if let current = self.connection, current.state != .cancelled,
-               !Self.isFailed(current.state) {
-                self.pendingConnections.append(conn)
-                conn.stateUpdateHandler = { [weak self] state in
-                    guard let self, case .ready = state else { return }
-                    // This socket has not won the session yet. Keep cursor UDP
-                    // out of its provisional hello: otherwise its flow could
-                    // arrive before adopt(), then be indistinguishable from
-                    // the old session's flow that adopt must retire.
-                    self.sendHello(on: conn, includeCursorPort: false)
-                    conn.receive(minimumIncompleteLength: 1, maximumLength: 1 << 18) {
-                        [weak self] data, _, isComplete, error in
-                        guard let self else { return }
-                        // Only a still-tracked candidate may adopt: adoption
-                        // of a rival and stop() both clear the list, so a
-                        // late callback can't evict a session or resurrect a
-                        // stopped receiver.
-                        guard self.pendingConnections.contains(where: { $0 === conn }) else {
-                            conn.cancel()
-                            return
-                        }
-                        self.pendingConnections.removeAll { $0 === conn }
-                        if let data, !data.isEmpty {
-                            self.adopt(conn, greeted: true, initialData: data)
-                        } else {
-                            Log.info("ignored a twin connection that closed at once"
-                                     + (error.map { " (\($0))" } ?? ""))
-                            conn.cancel()
-                        }
-                        _ = isComplete
-                    }
-                }
-                conn.start(queue: self.queue)
-            } else {
-                self.adopt(conn)
-            }
+            // connection that was already dying. Round 6 fixed that case — a
+            // newcomer arriving *while a connection was in hand* had to send
+            // bytes first — and left two gaps, which the round-6 iPad log then
+            // walked straight into: with nothing in hand every newcomer was
+            // adopted on sight, so an external watchdog's `nc -z` churned the
+            // session state and the status line every thirteen seconds; and
+            // "sent some bytes" is not the same claim as "is a sender".
+            //
+            // Both are closed by sending the proof through `ConnectionAdmission`
+            // (pure, tested): a 4-byte length and that many bytes of JSON
+            // naming a `type`, i.e. the `welcome` every sender emits here
+            // before anything else. Silence, a closed socket and noise all
+            // fail it, and the live session is never touched until something
+            // passes.
+            self.beginProving(conn, peer: peer, hadSession: self.connection != nil)
         }
-        listener?.stateUpdateHandler = { [weak self] state in
+        created.stateUpdateHandler = { [weak self] state in
             guard let self else { return }
+            // **The identity guard, which round 5 did not have.** A retired
+            // listener keeps reporting for a while after `cancel()`, and
+            // without this its `.cancelled` cleared `listenerHealthy` on the
+            // listener that had replaced it (so the next foreground restarted
+            // a healthy socket) and its `.failed` scheduled a restart that
+            // tore the healthy one down a second later. The cursor listener
+            // has had this guard since it was written; the TCP one had not.
+            guard self.listener === created else {
+                // One thing a retired listener still has to tell us: that it
+                // has let go of the port. That is the event `restartListener`
+                // is waiting for.
+                if case .cancelled = state {
+                    self.completeRebind(because: "the old listener released the port")
+                }
+                return
+            }
             switch state {
             case .ready:
                 self.listenerHealthy = true
+                self.listenerFailures = 0
                 self.setStatus("Listening on :\(self.port)")
             case .failed(let error):
-                Log.info("listener failed: \(error) — restarting in 1s")
                 self.listenerHealthy = false
+                self.listenerFailures += 1
+                let delay = ListenerRestartPolicy.backoff(failures: self.listenerFailures)
+                var note = ""
+                if case .posix(let code) = error, code == .EADDRINUSE {
+                    // Named, because the cause is ours and the cure is time:
+                    // the socket we just closed has not finished closing.
+                    note = " — the port is still held by the socket we just closed"
+                }
+                Log.info("listener failed: \(error)\(note) — rebinding in \(Int(delay))s "
+                         + "(attempt \(self.listenerFailures))")
                 self.setStatus("Listener failed — restarting…")
-                self.queue.asyncAfter(deadline: .now() + 1) { self.restartListener() }
+                self.queue.asyncAfter(deadline: .now() + delay) { [weak self] in
+                    self?.restartListener(reason: "the listener failed")
+                }
             case .cancelled:
                 self.listenerHealthy = false
             default: break
             }
         }
-        listener?.start(queue: queue)
+        created.start(queue: queue)
         startCursorListener()
     }
 
+    /// Everything a newcomer has said while it is still only a candidate.
+    /// Boxed because it is mutated from three closures, all of them on `queue`.
+    private final class ProofBox {
+        var buffered = Data()
+        var settled = false
+    }
+
+    /// Greet a newcomer and wait for it to prove it is a sender.
+    ///
+    /// Runs on `queue`. The live session — if there is one — is untouched for
+    /// the whole of this: `adopt` is the only thing that cancels it, and
+    /// `adopt` is only reached from a verdict of `.adopt`.
+    private func beginProving(_ conn: NWConnection, peer: String, hadSession: Bool) {
+        let proof = ProofBox()
+        pendingConnections.append(conn)
+
+        let settle: (ConnectionAdmission.Verdict) -> Void = { [weak self] verdict in
+            guard let self, !proof.settled else { return }
+            // Only a still-tracked candidate may settle: adoption of a rival
+            // and `stop()` both clear the list, so a late callback can neither
+            // evict a session nor resurrect a stopped receiver.
+            guard self.pendingConnections.contains(where: { $0 === conn }) else {
+                proof.settled = true
+                conn.cancel()
+                return
+            }
+            switch verdict {
+            case .keepReading:
+                return
+            case .adopt(let type):
+                proof.settled = true
+                self.pendingConnections.removeAll { $0 === conn }
+                // The transport label belongs to the session, so it is set when
+                // there *is* one: a probe from a loopback forwarder used to
+                // relabel a live WiFi session "USB" on the way past.
+                // usbmux-forwarded (cable) connections arrive from loopback;
+                // anything else came over the network.
+                self.transport = (peer.hasPrefix("127.0.0.1") || peer.hasPrefix("::1")
+                                  || peer.hasPrefix("localhost")) ? "USB" : "WiFi"
+                Log.info("adoption: \(peer) proved itself with a `\(type)` message"
+                         + (hadSession ? " — replacing the live session" : " — adopting it as the session"))
+                // `adopt` installs its own state handler, which is what breaks
+                // the handler → settle → conn cycle on this path.
+                self.adopt(conn, greeted: true, initialData: proof.buffered)
+            case .reject(let reason):
+                proof.settled = true
+                self.pendingConnections.removeAll { $0 === conn }
+                Log.info("adoption: \(peer) REFUSED — \(reason)"
+                         + (hadSession ? "; the live session is untouched" : ""))
+                // Drop the handler before cancelling: it holds this closure,
+                // which holds `conn`, and nothing is waiting to hear the
+                // `.cancelled` that follows.
+                conn.stateUpdateHandler = nil
+                conn.cancel()
+            }
+        }
+
+        func readMore() {
+            conn.receive(minimumIncompleteLength: 1,
+                         maximumLength: ConnectionAdmission.maxGreetingBytes) {
+                data, _, isComplete, error in
+                if let data, !data.isEmpty { proof.buffered.append(data) }
+                let closed = isComplete || error != nil
+                let verdict = ConnectionAdmission.judge(buffered: proof.buffered, closed: closed)
+                settle(verdict)
+                if case .keepReading = verdict, !proof.settled { readMore() }
+            }
+        }
+
+        conn.stateUpdateHandler = { [weak self] state in
+            switch state {
+            case .ready:
+                // The greeting has to go out first: a sender says nothing until
+                // it has read our `hello`, so waiting for bytes without sending
+                // one is a deadlock, not a test.
+                guard let self else { return }
+                self.sendHello(on: conn)
+                readMore()
+            case .failed(let error):
+                settle(.reject(reason: "the connection failed before it said anything (\(error))"))
+            case .cancelled:
+                settle(.reject(reason: "the connection was cancelled while proving itself"))
+            default:
+                break
+            }
+        }
+        queue.asyncAfter(deadline: .now() + ConnectionAdmission.proofTimeout) {
+            settle(ConnectionAdmission.judge(buffered: proof.buffered, timedOut: true))
+        }
+        conn.start(queue: queue)
+    }
+
     /// Make `conn` the session: replace any existing connection and reset
-    /// decoder state. `greeted` marks a newcomer that got a provisional hello
-    /// without the cursor port while it proved itself (see the listener), with
-    /// the bytes it sent back in `initialData`. Once adopted, the full hello
-    /// opens a cursor flow that unambiguously belongs to this session.
+    /// decoder state. `greeted` marks a newcomer that already got its hello
+    /// while it proved itself (see the listener), with the bytes it sent
+    /// back in `initialData`; a second hello would make the sender rebuild.
+    ///
+    /// Upstream v1.21.0 greets twice here — a provisional hello without the
+    /// cursor port during the proof, then a full one after adoption. That
+    /// pairs with upstream's listener. The fork's admission (round 7) sends
+    /// the *full* hello during the proof, because a sender says nothing until
+    /// it has read one, so an unconditional second greeting would hand this
+    /// fork's sender two identical hellos per session.
     private func adopt(_ conn: NWConnection, greeted: Bool = false, initialData: Data? = nil) {
         if greeted { Log.info("newcomer proved itself — adopting it as the session") }
         connection?.cancel()
@@ -666,6 +1087,25 @@ final class StreamReceiver: ObservableObject {
         resetStreamState()
         lastCursorSeq = 0   // the sender restarts its cursor sequence per session
         cursorPortAnnounced = false
+        // Assume legacy framing until this session's sender identifies itself;
+        // a new session may be a different, older Mac than the last one.
+        senderSpeaksTaggedFrames = false
+        // Same rule for the stats datagram: it is offered only once a sender
+        // says it reads them, and the sequence restarts with the connection
+        // (PROTOCOL.md 6.3).
+        senderReadsStatsDatagrams = false
+        statsSequence = 0
+        loggedStatsDatagramPath = false
+        loggedUnknownFrameType = false
+        loggedAudioFormat = false
+        loggedAudioMalformed = false
+        audioPacketsThisWindow = 0
+        audioBytesThisWindow = 0
+        // Any audio still buffered belongs to the previous sender; playing it
+        // would be an audible blip of the old session over the new one. A new
+        // peer also gets a fresh buffer target — it may be on a different
+        // network than the one the last target was grown for.
+        audioPlayer.startNewSession()
         // Hide the previous sender's cursor: replayed into a fresh video view
         // it would ghost over a new sender that never sends one (mirror mode
         // hides no local cursor and streams no sprite).
@@ -678,7 +1118,7 @@ final class StreamReceiver: ObservableObject {
             guard let self else { return }
             self.lastDataReceived = Date()
             self.setConnected(true)
-            self.sendHello(on: conn)
+            if !greeted { self.sendHello(on: conn) }
         }
         conn.stateUpdateHandler = { [weak self] state in
             guard let self, conn === self.connection else { return }   // replaced: stay quiet
@@ -701,10 +1141,6 @@ final class StreamReceiver: ObservableObject {
         receive(on: conn)
     }
 
-    private static func isFailed(_ state: NWConnection.State) -> Bool {
-        if case .failed = state { return true }
-        return false
-    }
 
     // MARK: - Liveness (ping + watchdog)
 
@@ -806,6 +1242,37 @@ final class StreamReceiver: ObservableObject {
             DispatchQueue.main.async {
                 self.macProtocolVersion = macPV
             }
+            // Who is calling, and is it who the user asked for?
+            let senderID = (obj["senderID"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+            let senderHost = obj["host"] as? String ?? ""
+            if let senderID {
+                let identity = SenderIdentity(id: senderID, host: senderHost)
+                DispatchQueue.main.async {
+                    self.knownSenders = SenderChoice.merge(self.knownSenders, seen: identity)
+                    self.currentSender = identity
+                }
+            } else {
+                DispatchQueue.main.async { self.currentSender = nil }
+            }
+            if SenderChoice.shouldReject(preferred: preferredSenderIDForQueue, senderID: senderID) {
+                let who = senderHost.isEmpty ? (senderID ?? "a Mac that does not identify itself") : senderHost
+                Log.info("refusing \(who): this \(deviceKind) is set to connect to another Mac")
+                reject(retryAfterMs: SenderChoice.defaultRetryAfterMs,
+                       reason: RejectionMessage.reasonOtherMacSelected)
+                return
+            }
+            // This message itself arrived untagged — the sender could not know
+            // what we speak until it read our `hello`. Every frame after it may
+            // be tagged, so the switch happens here, on the connection's queue,
+            // before the next frame is drained.
+            let tagged = macPV >= WireProtocol.taggedFrameVersion
+            if tagged != senderSpeaksTaggedFrames {
+                senderSpeaksTaggedFrames = tagged
+                Log.info("framing: \(tagged ? "tagged" : "legacy") (sender pv \(macPV))")
+            }
+            // Additive capability, read from the same message for the same
+            // reason: this is the first thing the sender says.
+            senderReadsStatsDatagrams = obj[StatsChannel.capabilityKey] as? Bool ?? false
             if macPV < WireProtocol.minSupportedPeer {
                 let msg = "The OpenDisplay app on your Mac is too old for this \(deviceKind) app. Update OpenDisplay on your Mac to reconnect."
                 DispatchQueue.main.async { self.peerSignal = .updateMac(message: msg) }
@@ -887,7 +1354,11 @@ final class StreamReceiver: ObservableObject {
             "device": deviceKind,
             "id": Self.installID,
             "pv": WireProtocol.version,   // issue #132 — absent on old receivers
-            "displayMaxFrameRate": displayMaxFrameRate,
+            // Additive capability (PROTOCOL.md 6.7): this receiver understands
+            // `AudioPacket`'s optional sequence number and counts duplicates
+            // with it. A sender that has never heard of the field ignores this
+            // key and keeps emitting the 15-byte header it always did.
+            "audioSeq": true,
         ]
         // Additive joint capability. The legacy rectangle below stays on the
         // wire while independently updated senders remain in the field.
@@ -924,7 +1395,19 @@ final class StreamReceiver: ObservableObject {
         // still active; it must not change bookkeeping for that live session.
         if connection === conn { cursorPortAnnounced = announcesCursorPort }
         sendControl(hello, on: conn)
-        Log.info("hello sent\(announcesCursorPort ? " (cursorPort \(cursorPort))" : "")")
+        // `pv` is also the audio readiness signal, and round 5 proved that
+        // needs saying out loud. Audio frames only exist in the tagged framing
+        // of protocol 4+, so the sender keeps its audio gate shut until it has
+        // read this number — and its "not sent" line and this one are the two
+        // ends of the same fact. If one appears without the other, the `hello`
+        // never arrived.
+        Log.info("hello sent\(cursorListenerReady ? " (cursorPort \(cursorPort))" : "")"
+                 + " — pv \(WireProtocol.version), ready for audio frames"
+                 + "\(audioMuted ? " (muted locally; the Mac still sends them)" : "")")
+        // `modSidebar` is connection-scoped state and the sender clears it on
+        // every ready connection, so it has to be re-asserted here — `hello` is
+        // the one message that is sent on every new or adopted link.
+        resendStickyModifiers(on: conn)
     }
 
     /// Every IP address of an up, non-loopback interface, for hello.addrs.
@@ -971,15 +1454,48 @@ final class StreamReceiver: ObservableObject {
     /// Touch events: x/y normalized [0,1] in video space, origin top-left.
     /// Stamped in *Mac* clock time (our clock + sync offset) so the Mac can
     /// measure touch→injection latency without doing its own clock sync.
-    func sendTouch(phase: String, x: Double, y: Double) {
+    func sendTouch(phase: String, x: Double, y: Double, button: String = "left") {
         var msg: [String: Any] = ["type": "touch", "phase": phase, "x": x, "y": y]
+        if button != "left" { msg["button"] = button }
         if let offset = clockOffsetMs { msg["t"] = nowMs + offset }
         sendControl(msg)
     }
 
-    /// Two-finger scroll: dx/dy in video pixels (natural-scrolling sign).
-    func sendScroll(dx: Double, dy: Double) {
-        sendControl(["type": "scroll", "dx": dx, "dy": dy])
+    /// Scroll: dx/dy in video pixels (natural-scrolling sign).
+    ///
+    /// `phase` is additive and optional (PROTOCOL.md 6.1). Omitted, this is the
+    /// message every build since pv 1 has sent, and a sender that does not know
+    /// the field ignores it. Present, it carries the macOS scroll-gesture
+    /// phases — which is what gives a Native-mode one-finger scroll real
+    /// rubber-banding and real inertia instead of a stream of wheel clicks.
+    func sendScroll(dx: Double, dy: Double, phase: String? = nil) {
+        var msg: [String: Any] = ["type": "scroll", "dx": dx, "dy": dy]
+        if let phase { msg["phase"] = phase }
+        sendControl(msg)
+    }
+
+    /// Pinch-to-zoom. `scale` is the *incremental* factor since the last
+    /// message (1.0 = no change), so a sender never has to carry gesture state
+    /// and a dropped message costs a fraction of a step rather than desyncing
+    /// the zoom level. `phase` is `began`, `changed`, `ended` or `cancelled`;
+    /// the boundaries carry `scale` 1 and exist only to reset the Mac's
+    /// accumulator. Additive at pv 3, no bump.
+    ///
+    /// `x`/`y` are the **pinch centroid**, normalized `[0,1]` in video space
+    /// exactly like `touch`, and additive: a sender that does not know them
+    /// applies the zoom at its own cursor, which is what every build before
+    /// round 8 did and is why nothing zoomed. The Mac has one cursor and it is
+    /// wherever the last click left it; the fingers are somewhere else
+    /// entirely, and an application only zooms a gesture that lands over it.
+    ///
+    /// Sent for an *indirect* (trackpad) pinch too, where the recognizer's
+    /// location is the pointer — which is exactly the right answer there, and
+    /// makes the Mac's warp a no-op because the pointer already drives its
+    /// cursor through `pointer`.
+    func sendZoom(scale: Double, phase: String, x: Double? = nil, y: Double? = nil) {
+        var msg: [String: Any] = ["type": "zoom", "scale": scale, "phase": phase]
+        if let x, let y { msg["x"] = x; msg["y"] = y }
+        sendControl(msg)
     }
 
     /// Apple Pencil stroke/hover. azimuth and altitude are radians.
@@ -1003,6 +1519,81 @@ final class StreamReceiver: ObservableObject {
         sendControl(["type": "proximity", "entering": entering, "x": x, "y": y])
     }
 
+    /// Trackpad / mouse pointer hover: move the Mac's cursor with no button
+    /// pressed. Same normalization and clock stamp as `sendTouch`.
+    func sendPointer(phase: String, x: Double, y: Double) {
+        var msg: [String: Any] = ["type": "pointer", "phase": phase, "x": x, "y": y]
+        if let offset = clockOffsetMs { msg["t"] = nowMs + offset }
+        sendControl(msg)
+    }
+
+    /// Hardware keyboard key events (issue #6).
+    func sendKey(code: Int, down: Bool, mod: UInt, char: String? = nil) {
+        var msg: [String: Any] = ["type": "key", "code": code, "down": down, "mod": mod]
+        if let char, !char.isEmpty { msg["char"] = char }
+        sendControl(msg)
+    }
+
+    /// Latched modifiers from the on-screen sidebar (issue #7).
+    ///
+    /// **Connection-scoped state, not an event.** The sender clears its latched
+    /// set whenever a connection becomes ready, and a receiver can be adopted
+    /// by a new connection without `connected` ever going false (a path
+    /// migration, a redial inside the grace window). Keeping the flags here —
+    /// as the single source of truth the sidebar UI renders from — and
+    /// re-asserting them after every `hello` is what stops the iPad showing ⌘
+    /// active while the Mac has already forgotten it.
+    @Published private(set) var stickyModifierFlags: UInt = 0
+
+    func sendStickyModifiers(_ flags: UInt) {
+        DispatchQueue.main.async { self.stickyModifierFlags = flags }
+        sendControl(["type": "modSidebar", "flags": flags])
+    }
+
+    /// Re-assert the latched set on a (re)connected link. Skipped when nothing
+    /// is latched: the sender starts every connection cleared, so sending
+    /// `{"flags":0}` would be noise.
+    private func resendStickyModifiers(on conn: NWConnection) {
+        let flags = stickyModifierFlags
+        guard flags != 0 else { return }
+        sendControl(["type": "modSidebar", "flags": flags], on: conn)
+        Log.info("re-asserted latched modifiers (\(flags)) after hello")
+    }
+
+    /// Drop the latched set. The sender releases everything it holds when a
+    /// session ends, so the sidebar must not keep claiming a modifier the Mac
+    /// no longer has.
+    func clearStickyModifiers() {
+        guard stickyModifierFlags != 0 else { return }
+        DispatchQueue.main.async { self.stickyModifierFlags = 0 }
+    }
+
+    /// Send one `stats` report on **both** channels.
+    ///
+    /// The TCP copy is what every sender has always read. The datagram copy is
+    /// the one that arrives on a congested link: `stats` is the sender's only
+    /// view of this end, and on the operator's LTE/DERP session the TCP copy
+    /// was taking 7–54 seconds because it queues behind the video on the same
+    /// connection (PROTOCOL.md 6.3, `Shared/StatsChannel.swift`).
+    ///
+    /// The datagram goes out on the cursor flow — the UDP "connection" the
+    /// listener accepted from this sender, which is bidirectional: sending on
+    /// it reaches the sender's ephemeral port, the same one its cursor
+    /// datagrams arrive from. No second socket, no second port, no second
+    /// negotiation.
+    private func sendStats(_ message: [String: Any]) {
+        sendControl(message)
+        guard senderReadsStatsDatagrams, let flow = cursorConnection,
+              let payload = try? JSONSerialization.data(withJSONObject: message) else { return }
+        // No 4-byte length prefix: a datagram is already framed (6.3).
+        flow.send(content: payload, completion: .contentProcessed { _ in })
+        if !loggedStatsDatagramPath {
+            loggedStatsDatagramPath = true
+            Log.info("stats: also sent as a datagram on the cursor channel — "
+                     + "the Mac's congestion controller can see this end while TCP is backed up")
+        }
+    }
+
     private func sendControl(_ message: [String: Any], on conn: NWConnection? = nil,
                              completion: (() -> Void)? = nil) {
         guard let conn = conn ?? connection,
@@ -1010,9 +1601,12 @@ final class StreamReceiver: ObservableObject {
             completion?()
             return
         }
-        var header = UInt32(payload.count).bigEndian
-        var frame = Data(bytes: &header, count: 4)
-        frame.append(payload)
+        // Deliberately untagged, at every protocol version: receiver-to-sender
+        // frames are all JSON control messages (PROTOCOL.md 4 — "the sender
+        // needs no demux"), so there is nothing for a type byte to
+        // disambiguate. Tagging this direction would be a wire change with no
+        // reader, and would break every sender below pv 4.
+        let frame = FrameCodec.encode(payload, type: .json, tagged: false)
         conn.send(content: frame, completion: .contentProcessed { error in
             if let error { Log.info("control send error: \(error)") }
             completion?()
@@ -1055,24 +1649,88 @@ final class StreamReceiver: ObservableObject {
             guard buffer.distance(from: cursor, to: buffer.endIndex) >= 4 + len else { break }
             let start = buffer.index(cursor, offsetBy: 4)
             let end = buffer.index(start, offsetBy: len)
-            handleAnnexB(Data(buffer[start..<end]))
+            route(body: Data(buffer[start..<end]))
             cursor = end
         }
         buffer.removeSubrange(buffer.startIndex..<cursor)
     }
 
+    /// Send one deframed body to whatever handles its kind.
+    ///
+    /// How the kind is determined depends on the sender: a protocol-4 sender
+    /// tags it explicitly, an older one leaves it to be inferred. Which of the
+    /// two applies is `senderSpeaksTaggedFrames`, latched from `welcome` — it
+    /// is never guessed from the bytes, because the whole reason for the tag
+    /// is that guessing stops working once audio shares the wire.
+    private func route(body: Data) {
+        guard let frame = FrameCodec.decode(body: body, tagged: senderSpeaksTaggedFrames) else {
+            Log.info("dropping malformed empty tagged frame")
+            return
+        }
+        switch frame.type {
+        case .json:
+            handleVideoChannelJSON(frame.payload)
+        case .video:
+            handleAnnexB(frame.payload)
+        case .audio:
+            handleAudioPacket(frame.payload)
+        case nil:
+            // A type this build does not know: skip it. This is what makes a
+            // future frame type additive rather than a breaking change.
+            if !loggedUnknownFrameType {
+                loggedUnknownFrameType = true
+                Log.info("ignoring frame of unknown type (sender speaks a newer protocol)")
+            }
+        }
+    }
+
+    // MARK: - Audio
+
+    /// Parse an audio packet and account for it.
+    ///
+    /// Phase 2 verifies the whole path — capture, encode, frame, deframe,
+    /// parse — with nothing audible to get wrong; phase 3 adds the decoder and
+    /// playback. Counting packets and logging the format once is what makes
+    /// the path observable in the meantime.
+    private func handleAudioPacket(_ data: Data) {
+        guard let packet = AudioPacket.decode(data) else {
+            if !loggedAudioMalformed {
+                loggedAudioMalformed = true
+                Log.info("audio: undecodable packet (\(data.count) bytes) — ignoring")
+            }
+            return
+        }
+        audioPacketsThisWindow += 1
+        audioBytesThisWindow += packet.payload.count
+
+        // Audio's own end-to-end latency, computed exactly as video's is
+        // (StreamReceiver.enqueueFrame) so the two are directly comparable:
+        // the packet's sender-clock capture time against our clock, mapped
+        // through the ping/pong offset. Comparing them is what turns two
+        // latencies into an A/V sync measurement.
+        if let offset = clockOffsetMs {
+            let e2e = (nowMs + offset) - packet.ptsMs
+            // Same sanity window as the video path: a wild value means the
+            // offset is not settled yet, not that audio is 4 seconds late.
+            if e2e > -50, e2e < 5000 {
+                audioE2eWindow.append(e2e)
+                if audioE2eWindow.count > maxSamples { audioE2eWindow.removeFirst() }
+            }
+        }
+        if !loggedAudioFormat {
+            loggedAudioFormat = true
+            Log.info("audio: receiving \(packet.sampleRate)Hz \(packet.channels)ch, "
+                     + "\(packet.payload.count)B packets"
+                     + (packet.sequence != nil
+                        ? " — sequence-stamped (first seq \(packet.sequence!)), duplicates counted"
+                        : " — NOT sequence-stamped: this sender is too old to detect duplicates"))
+        }
+        audioPlayer.enqueue(packet)
+    }
+
     // MARK: - Annex B -> CMSampleBuffer
 
     private func handleAnnexB(_ data: Data) {
-        // Pure JSON payload = control message (pong, cursor sprite etc.).
-        // Video frames also begin with '{' (telemetry prefix) but always
-        // contain start codes — the null bytes make them unambiguous even
-        // against multi-KB JSON (cursor sprites are base64, NUL-free).
-        if data.count < 32_768, data.first == UInt8(ascii: "{"), !data.contains(0x00) {
-            handleVideoChannelJSON(data)
-            return
-        }
-
         // Split on 4-byte start codes (our sender only emits 00 00 00 01).
         // Bytes before the FIRST start code are the telemetry prefix
         // ({"cap":…,"snd":…} stamped by the Mac).
@@ -1289,6 +1947,19 @@ final class StreamReceiver: ObservableObject {
             stats.decodeP50 = percentile(decodeWindow, 0.5)
             stats.photonP50 = percentile(photonWindow, 0.5)
             stats.photonP95 = percentile(photonWindow, 0.95)
+            stats.audioE2eP50 = percentile(audioE2eWindow, 0.5)
+            // Peek, not drain: the 5s wire report owns the consuming read.
+            let audioLive = audioPlayer.peekStats()
+            stats.audioDepth = audioLive.depth
+            stats.audioTarget = audioLive.target
+            stats.audioUnderruns = audioLive.underruns
+            stats.audioDrops = audioLive.dropped
+            // Skew only means something when both halves were actually
+            // measured; with no audio (or before the clock offset settles) a
+            // difference against zero would read as a huge false skew.
+            stats.avSkewMs = (stats.audioE2eP50 > 0 && stats.e2eP50 > 0)
+                ? stats.audioE2eP50 - stats.e2eP50
+                : 0
             framesThisWindow = 0
             bytesThisWindow = 0
             stallsThisWindow = 0
@@ -1301,8 +1972,17 @@ final class StreamReceiver: ObservableObject {
             statsReportCounter += 1
             if statsReportCounter >= 5 {
                 statsReportCounter = 0
-                sendControl([
+                // Safe from this queue: the player serialises on its own
+                // ("receiver.audio"), so this is a hop, not reentrancy.
+                let audioStats = audioPlayer.drainStats()
+                statsSequence &+= 1
+                sendStats([
                     "type": "stats",
+                    // Per-connection sequence (PROTOCOL.md 6.3): the sender
+                    // gets two copies of this report — one over TCP, one over
+                    // the UDP cursor flow — and applies whichever arrives
+                    // first.
+                    StatsChannel.sequenceKey: Int(statsSequence),
                     "transport": transport,
                     "fps": fps,
                     "mbps": (stats.mbps * 10).rounded() / 10,
@@ -1319,7 +1999,47 @@ final class StreamReceiver: ObservableObject {
                     "ph50": stats.photonP50.rounded(),
                     "ph95": stats.photonP95.rounded(),
                     "offsetKnown": clockOffsetMs != nil,
+                    // Audio arrivals over the same 5s the rest of this report
+                    // covers, so a silent channel is visible in the Mac's log
+                    // as a zero rather than as an absent field.
+                    "aPkt": audioPacketsThisWindow,
+                    "aKB": audioBytesThisWindow / 1024,
+                    // Buffer health: packets arriving is not the same as
+                    // packets heard, and these are what tell the two apart.
+                    "aDepth": audioStats.depth,
+                    "aUnder": audioStats.underruns,
+                    "aDrop": audioStats.dropped,
+                    "aReord": audioStats.reordered,
+                    // Target and adaptation count together say whether the
+                    // starting guess of 3 packets was right for this link.
+                    "aTgt": audioStats.target,
+                    "aAdapt": audioStats.adaptations,
+                    // Identity, from the sender's sequence number (PROTOCOL.md
+                    // 6.7). `aDup` is the echo counter and must be 0; `aReplay`
+                    // is the same question asked at the other end of the buffer
+                    // and must be 0 too. `aLost` is what the link dropped.
+                    "aDup": audioStats.duplicates,
+                    "aReplay": audioStats.replays,
+                    "aLost": audioStats.lost,
+                    // Continuity, from the decoder's point of view. `aGap` is
+                    // how many times the audio jumped in this window — a flush,
+                    // an underrun, a lost packet, a trim — and therefore how
+                    // many times the AAC decoder had to be re-primed so it
+                    // would not overlap-add the first frame after the gap onto
+                    // the last frame before it. `aTrim` is standing latency
+                    // deliberately shed. Both belong in the Mac's log because
+                    // the echo they explain is heard on the iPad but caused by
+                    // the shape of the whole link.
+                    "aGap": audioStats.discontinuities,
+                    "aTrim": audioStats.trimmed,
+                    // The sync measurement itself: audio latency, and how far
+                    // it sits from video's. Both on the Mac's clock.
+                    "aE2e50": stats.audioE2eP50.rounded(),
+                    "avSkew": stats.avSkewMs.rounded(),
                 ])
+                audioE2eWindow.removeAll(keepingCapacity: true)
+                audioPacketsThisWindow = 0
+                audioBytesThisWindow = 0
                 e2eWindow.removeAll(keepingCapacity: true)
                 encodeWindow.removeAll(keepingCapacity: true)
                 decodeWindow.removeAll(keepingCapacity: true)
@@ -1423,7 +2143,24 @@ final class StreamReceiver: ObservableObject {
                 self.macProtocolVersion = WireProtocol.assumedWhenAbsent
             }
         }
-        if !value { setStatus("Listening on :9000") }
+        // The link is the only thing feeding the audio engine: without this it
+        // keeps running after a drop, holding the output route and the audio
+        // session for a stream that has stopped, and the packets buffered when
+        // the link died would play as a stale blip against whatever picture
+        // came back. `adopt()` calls `startNewSession()`, so a reconnect brings
+        // it up again from scratch. Covers every way a session can die —
+        // socket failure, EOF, the watchdog — which `closeSession` (sleep and
+        // quit) alone did not.
+        if !value { audioPlayer.stop() }
+        if !value { clearStickyModifiers() }
+        // Only claim to be listening when something is actually bound. The
+        // round-5 log has `status: Listening on :9000` printed by the sleep
+        // path at the exact moment `closeSession` cancelled the listener,
+        // which made the restart storm that followed a great deal harder to
+        // read than it needed to be.
+        if !value {
+            setStatus(listenerIsLive ? "Listening on :\(port)" : "Not listening")
+        }
         else {
             setStatus("Connected")
             // Remember the first ever successful connection to a Mac so the
