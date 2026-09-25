@@ -359,7 +359,7 @@ Coordinates use the conventions of section 7.
 
 | `type` | Since | Fields | Purpose |
 |---|---|---|---|
-| `hello` | pv 1 | `pixelsWide`, `pixelsHigh`, `scale`, `device`?, `id`?, `pv`?, `audioSeq`? | Identify the panel; (re)sent on connect and on rotation |
+| `hello` | pv 1 | `pixelsWide`, `pixelsHigh`, `scale`, `device`?, `id`?, `pv`?, `audioSeq`?, `admissionAck`? | Identify the panel; (re)sent on connect and on rotation |
 | `ping` | pv 1 | `t` | Liveness + clock sync probe |
 | `touch` | pv 1 | `phase`, `x`, `y`, `button`?, `t`? | Finger, trackpad and mouse button input |
 | `scroll` | pv 1 | `dx`, `dy`, `phase`? | Two-finger / trackpad / wheel scroll; `phase` is additive at pv 3 |
@@ -374,6 +374,7 @@ Coordinates use the conventions of section 7.
 | `sleeping` | pv 2 | none | Device locked; session ends, reconnect on wake expected |
 | `closing` | pv 2 | none | App quit; session ends for good |
 | `rejected` | pv 4 | `retryAfterMs`?, `reason`? | "Not you" — this receiver is configured for a different sender (section 6.6) |
+| `admitted` | pv 4 (additive) | none | Sender chosen; it may create the display (section 6.6) |
 
 **`hello`** MUST be the first message a receiver sends on every new
 connection, because the sender sizes its virtual display from it and can do
@@ -989,6 +990,14 @@ and `welcome.senderID` is what lets it.
 | `type` | Since | Direction | Fields | Purpose |
 |---|---|---|---|---|
 | `rejected` | pv 4 (additive) | receiver → sender | `retryAfterMs`?, `reason`? | "Not you. Try again later." |
+| `admitted` | pv 4 (additive) | receiver → sender | — | This sender was selected; it may create its display. |
+
+When `hello.admissionAck` is true, a sender MUST send `welcome` but MUST NOT
+create its display or capture pipeline until it receives `admitted` on that
+connection. The receiver sends `admitted` only after accepting that sender's
+`welcome`; it sends `rejected` to a sender it does not accept. A sender that
+does not recognize `hello.admissionAck` keeps the previous behavior. A
+receiver without this capability leaves the sender's previous behavior intact.
 
 A receiver that is configured to accept a specific sender and finds, from
 `welcome.senderID`, that this is not that sender, SHOULD send `rejected`
@@ -1179,6 +1188,7 @@ Mechanics at a glance (the policy behind them lives in COMPATIBILITY.md):
 | 4 (additive) | `hello.audioSeq` and the audio packet's `sequence` field (4.2, 6.1); negotiated, optional, no bump |
 | 4 (additive) | `zoom.x`/`zoom.y`, the pinch centroid (6.1); optional, no bump |
 | 4 (additive) | `welcome.statsUdp`, `stats.sq`, and `stats` on the UDP cursor flow (6.1, 6.2, 6.3); negotiated, optional, no bump |
+| 4 (additive) | `hello.admissionAck` and `admitted` (6.6); negotiated, optional, no bump |
 
 ---
 
@@ -1338,3 +1348,4 @@ This file is versioned by git; the authoritative change log is
 | 2026-09-18 | Additive: `hello.audioSeq` and the audio packet's optional `sequence` field (sections 4.2 and 6.1), negotiated so an unsequenced peer receives the bytes it always did; `zoom.scale` gains the normative "the product of a gesture's increments is its total magnification" rule, the warning about recognizers whose scale-reset affordance is ignored for indirect pinches, and a per-message bound on both sides |
 | 2026-09-18 | Additive: `zoom.x` / `zoom.y`, the pinch centroid (section 6.1), because a zoom aimed at the sender's own cursor is aimed at nothing; `zoom.phase` `"cancelled"` gains the rule that a sender closes its gesture series with the platform's *ended* phase |
 | 2026-09-18 | Additive: `welcome.statsUdp` and `stats.sq`, and `stats` on the reverse direction of the UDP cursor flow (sections 6.1, 6.2, 6.3), because the report a congestion controller needs most is the one TCP delivers last; section 5.2 gains the note that the official sender now changes the encoded size mid-session, and Appendix B gains four implementer's notes on congestion control |
+| 2026-09-25 | Additive: `hello.admissionAck` and `admitted` (section 6.6), so a refused sender does not create a virtual display during the identity handshake |

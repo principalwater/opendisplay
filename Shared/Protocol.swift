@@ -56,6 +56,7 @@ enum FrameType: UInt8 {
 /// keep this change additive and low-risk; unify later if we do a wider pass.
 enum WireMessage {
     static let welcome = "welcome"                  // Mac -> phone: Mac's pv + min supported
+    static let admitted = "admitted"                // receiver -> Mac: chosen sender may create its display
     static let updateRequired = "updateRequired"    // Mac -> phone: peer is below the Mac's floor
     static let sleeping = "sleeping"                // phone -> Mac: device locked, reconnect on wake
     static let closing = "closing"                  // phone -> Mac: app quit, end the session for good
@@ -149,11 +150,8 @@ enum ListenerRestartPolicy {
 ///    stray byte, still qualified.
 ///
 /// The proof is now a **frame the sender could have sent**: a 4-byte
-/// big-endian length followed by that many bytes of JSON naming a `type`. That
-/// is `welcome`, which every sender emits on this connection before anything
-/// else and which is deliberately untagged (PROTOCOL.md 5) — so the test needs
-/// no negotiated state and cannot be satisfied by silence, by a closed socket,
-/// or by noise.
+/// big-endian length followed by a JSON control message. A chosen sender is
+/// identified by `welcome`; cursor, ping, or video frames can precede it.
 enum ConnectionAdmission {
 
     /// How long a newcomer has to prove itself before it is dropped.
@@ -167,39 +165,105 @@ enum ConnectionAdmission {
     /// The largest greeting worth reading. A `welcome` is ~60 bytes; anything
     /// past this is not a handshake and must not be buffered.
     static let maxGreetingBytes = 64 * 1024
+    /// A pre-welcome video frame can be large. Skip its body without keeping
+    /// it in memory, but reject absurd length prefixes immediately.
+    /// ponytail: raise this ceiling only if a measured keyframe exceeds 8 MiB.
+    static let maxCandidateFrameBytes = 8 * 1024 * 1024
 
     enum Verdict: Equatable {
         /// A well-formed control frame arrived: this is a sender.
         case adopt(type: String)
+        /// A valid sender, but the receiver is reserved for another Mac.
+        case refuse(reason: String, sender: SenderIdentity?)
         /// Nothing conclusive yet — keep reading.
         case keepReading
         /// Never a sender. The reason is the log line.
         case reject(reason: String)
     }
 
-    /// Judge the bytes a newcomer has sent so far.
-    ///
-    /// - Parameters:
-    ///   - buffered: everything received on this connection since it was
-    ///     accepted.
-    ///   - closed: the peer hung up or errored.
-    ///   - timedOut: `proofTimeout` elapsed with no verdict.
-    static func judge(buffered: Data, closed: Bool = false, timedOut: Bool = false) -> Verdict {
-        if let type = greetingType(in: buffered) { return .adopt(type: type) }
-        if buffered.count > maxGreetingBytes {
-            return .reject(reason: "sent \(buffered.count) bytes without a control message")
+    struct Proof {
+        private(set) var buffered = Data()
+        private var priorControl = Data()
+        private(set) var droppedVideo = false
+        private var bytesToSkip = 0
+        private var receivedBytes = 0
+
+        /// Keep control frames for `adopt(initialData:)`. With a chosen Mac,
+        /// video before `welcome` is skipped and followed by a keyframe request.
+        mutating func read(_ incoming: Data, preferredSenderID: String = SenderChoice.anyMac,
+                           closed: Bool = false, timedOut: Bool = false) -> Verdict {
+            receivedBytes += incoming.count
+            var remaining = incoming
+            if bytesToSkip > 0 {
+                let count = min(bytesToSkip, remaining.count)
+                remaining.removeFirst(count)
+                bytesToSkip -= count
+            }
+            buffered.append(remaining)
+
+            if preferredSenderID.isEmpty {
+                if let type = ConnectionAdmission.greeting(in: buffered)?["type"] as? String {
+                    return .adopt(type: type)
+                }
+                if buffered.count > maxGreetingBytes {
+                    return .reject(reason: "sent \(receivedBytes) bytes without a control message")
+                }
+            } else {
+                while bytesToSkip == 0, buffered.count >= 4 {
+                    let base = buffered.startIndex
+                    var length: UInt32 = 0
+                    for i in 0..<4 { length = (length << 8) | UInt32(buffered[base + i]) }
+                    guard length > 0, length <= UInt32(maxCandidateFrameBytes) else {
+                        return .reject(reason: "invalid opening frame length \(length)")
+                    }
+                    let frameBytes = 4 + Int(length)
+                    if length > UInt32(maxGreetingBytes) && buffered.count < frameBytes {
+                        droppedVideo = true
+                        bytesToSkip = frameBytes - buffered.count
+                        buffered.removeAll(keepingCapacity: true)
+                        break
+                    }
+                    guard buffered.count >= frameBytes else { break }
+                    if let greeting = ConnectionAdmission.greeting(in: buffered),
+                       greeting["type"] as? String == WireMessage.welcome {
+                        let senderID = greeting["senderID"] as? String
+                        if SenderChoice.shouldReject(preferred: preferredSenderID, senderID: senderID) {
+                            let sender = senderID.flatMap { id in
+                                id.isEmpty ? nil : SenderIdentity(id: id, host: greeting["host"] as? String ?? "")
+                            }
+                            return .refuse(reason: RejectionMessage.reasonOtherMacSelected, sender: sender)
+                        }
+                        buffered = priorControl + buffered
+                        return .adopt(type: WireMessage.welcome)
+                    }
+                    if ConnectionAdmission.greeting(in: buffered) != nil,
+                       priorControl.count + frameBytes <= maxGreetingBytes {
+                        priorControl.append(buffered.prefix(frameBytes))
+                    } else {
+                        droppedVideo = true
+                    }
+                    buffered.removeFirst(frameBytes)
+                }
+            }
+            if closed {
+                return .reject(reason: receivedBytes == 0
+                               ? "closed without sending anything (a port probe, not a sender)"
+                               : "closed after \(receivedBytes) byte(s) without an accepted control message")
+            }
+            if timedOut {
+                return .reject(reason: receivedBytes == 0
+                               ? "sent nothing within \(Int(proofTimeout))s"
+                               : "sent \(receivedBytes) byte(s) in \(Int(proofTimeout))s without an accepted control message")
+            }
+            return .keepReading
         }
-        if closed {
-            return .reject(reason: buffered.isEmpty
-                           ? "closed without sending anything (a port probe, not a sender)"
-                           : "closed after \(buffered.count) byte(s) that were not a control message")
-        }
-        if timedOut {
-            return .reject(reason: buffered.isEmpty
-                           ? "sent nothing within \(Int(proofTimeout))s"
-                           : "sent \(buffered.count) byte(s) in \(Int(proofTimeout))s but no control message")
-        }
-        return .keepReading
+    }
+
+    static func judge(buffered: Data, preferredSenderID: String = SenderChoice.anyMac,
+                      closed: Bool = false, timedOut: Bool = false) -> Verdict {
+        var proof = Proof()
+        return proof.read(buffered, preferredSenderID: preferredSenderID,
+                          closed: closed, timedOut: timedOut)
     }
 
     /// The `type` of the first complete JSON control frame in `data`, if there
@@ -210,6 +274,10 @@ enum ConnectionAdmission {
     /// protocol forbids a future sender from tagging its greeting, and a rule
     /// that rejected it would be a compatibility trap set for ourselves.
     static func greetingType(in data: Data) -> String? {
+        greeting(in: data)?["type"] as? String
+    }
+
+    private static func greeting(in data: Data) -> [String: Any]? {
         guard data.count >= 4 else { return nil }
         let base = data.startIndex
         var length: UInt32 = 0
@@ -222,7 +290,7 @@ enum ConnectionAdmission {
             guard let object = try? JSONSerialization.jsonObject(with: Data(candidate)),
                   let dict = object as? [String: Any],
                   let type = dict["type"] as? String, !type.isEmpty else { continue }
-            return type
+            return dict
         }
         return nil
     }

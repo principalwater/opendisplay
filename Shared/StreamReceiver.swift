@@ -913,10 +913,9 @@ final class StreamReceiver: ObservableObject {
             //
             // Both are closed by sending the proof through `ConnectionAdmission`
             // (pure, tested): a 4-byte length and that many bytes of JSON
-            // naming a `type`, i.e. the `welcome` every sender emits here
-            // before anything else. Silence, a closed socket and noise all
-            // fail it, and the live session is never touched until something
-            // passes.
+            // naming a `type`. With a chosen Mac, only its `welcome` passes;
+            // cursor, ping, or video can precede it. Silence, a closed socket
+            // and noise all fail without touching the live session.
             self.beginProving(conn, peer: peer, hadSession: self.connection != nil)
         }
         created.stateUpdateHandler = { [weak self] state in
@@ -970,7 +969,7 @@ final class StreamReceiver: ObservableObject {
     /// Everything a newcomer has said while it is still only a candidate.
     /// Boxed because it is mutated from three closures, all of them on `queue`.
     private final class ProofBox {
-        var buffered = Data()
+        var scanner = ConnectionAdmission.Proof()
         var settled = false
     }
 
@@ -1010,7 +1009,33 @@ final class StreamReceiver: ObservableObject {
                          + (hadSession ? " — replacing the live session" : " — adopting it as the session"))
                 // `adopt` installs its own state handler, which is what breaks
                 // the handler → settle → conn cycle on this path.
-                self.adopt(conn, greeted: true, initialData: proof.buffered)
+                self.adopt(conn, greeted: true, initialData: proof.scanner.buffered)
+                self.sendControl(["type": WireMessage.admitted], on: conn)
+                if proof.scanner.droppedVideo {
+                    self.sendControl(["type": "kf"], on: conn)
+                }
+            case .refuse(let reason, let sender):
+                proof.settled = true
+                self.pendingConnections.removeAll { $0 === conn }
+                if let sender {
+                    DispatchQueue.main.async {
+                        self.knownSenders = SenderChoice.merge(self.knownSenders, seen: sender)
+                    }
+                }
+                Log.info("admission: \(peer) refused before adoption — \(reason)"
+                         + (hadSession ? "; the live session is untouched" : ""))
+                var finished = false
+                let finish = {
+                    guard !finished else { return }
+                    finished = true
+                    conn.stateUpdateHandler = nil
+                    conn.cancel()
+                }
+                self.sendControl(RejectionMessage.payload(
+                    retryAfterMs: SenderChoice.defaultRetryAfterMs, reason: reason), on: conn) {
+                    self.queue.async { finish() }
+                }
+                self.queue.asyncAfter(deadline: .now() + 1) { finish() }
             case .reject(let reason):
                 proof.settled = true
                 self.pendingConnections.removeAll { $0 === conn }
@@ -1028,9 +1053,10 @@ final class StreamReceiver: ObservableObject {
             conn.receive(minimumIncompleteLength: 1,
                          maximumLength: ConnectionAdmission.maxGreetingBytes) {
                 data, _, isComplete, error in
-                if let data, !data.isEmpty { proof.buffered.append(data) }
                 let closed = isComplete || error != nil
-                let verdict = ConnectionAdmission.judge(buffered: proof.buffered, closed: closed)
+                let verdict = proof.scanner.read(
+                    data ?? Data(), preferredSenderID: self.preferredSenderIDForQueue,
+                    closed: closed)
                 settle(verdict)
                 if case .keepReading = verdict, !proof.settled { readMore() }
             }
@@ -1054,7 +1080,8 @@ final class StreamReceiver: ObservableObject {
             }
         }
         queue.asyncAfter(deadline: .now() + ConnectionAdmission.proofTimeout) {
-            settle(ConnectionAdmission.judge(buffered: proof.buffered, timedOut: true))
+            settle(.reject(reason: "sent no accepted control message within "
+                           + "\(Int(ConnectionAdmission.proofTimeout))s"))
         }
         conn.start(queue: queue)
     }
@@ -1354,6 +1381,7 @@ final class StreamReceiver: ObservableObject {
             "device": deviceKind,
             "id": Self.installID,
             "pv": WireProtocol.version,   // issue #132 — absent on old receivers
+            "admissionAck": true,  // sender waits for `admitted` before creating a display
             // Additive capability (PROTOCOL.md 6.7): this receiver understands
             // `AudioPacket`'s optional sequence number and counts duplicates
             // with it. A sender that has never heard of the field ignores this

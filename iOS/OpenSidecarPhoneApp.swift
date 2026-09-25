@@ -51,6 +51,7 @@ struct ReceiverScreen: View {
     // then there is nothing to switch between and the pixels stay with the
     // video.
     @AppStorage("showMacSwitcher") private var showMacSwitcher = true
+    @AppStorage("connectDelaySeconds") private var connectDelaySeconds = 3
     @AppStorage(TouchMode.defaultsKey) private var touchModeRaw = TouchMode.default.rawValue
     // First-run onboarding (issue #49): explain the Mac app is required.
     // Shown until either the user dismisses it or the device connects once.
@@ -122,7 +123,10 @@ struct ReceiverScreen: View {
                         }
                     }
                 } else {
-                    IdleView(receiver: model.receiver, showSettings: $showSettings)
+                    IdleView(receiver: model.receiver,
+                             showSettings: $showSettings,
+                             choosingInitialMac: model.choosingInitialMac,
+                             onChoose: { model.finishInitialChoice() })
                 }
             }
             .onAppear { model.receiver.setOrientation(portrait: geo.size.height > geo.size.width) }
@@ -169,6 +173,12 @@ struct ReceiverScreen: View {
             default: break
             }
         }
+        .onChange(of: connectDelaySeconds) { seconds in
+            if seconds == 0 { model.finishInitialChoice() }
+        }
+        .onChange(of: model.receiver.preferredSenderID) { _ in
+            model.finishInitialChoice()
+        }
         // The deliberate "screen off" signal: locking the device makes
         // protected data unavailable (a plain app switch doesn't). This is
         // what separates "put the iPhone to sleep — end the session now"
@@ -200,7 +210,7 @@ struct ReceiverScreen: View {
         }
         .onAppear {
             UIApplication.shared.isIdleTimerDisabled = true
-            model.start()
+            model.start(delaySeconds: connectDelaySeconds)
             // Show the first-run hint unless the device has connected before
             // or the user already dismissed it.
             if !hasConnectedBefore && !onboardingDismissed {
@@ -244,11 +254,48 @@ struct MacSwitcherButton: View {
     }
 }
 
+/// The idle-screen "Connect to" control, next to Settings. It names the Mac
+/// this device will accept and opens the same picker as Settings and the
+/// streaming switcher, so a remembered Mac can be picked before it dials in
+/// without hunting through the settings sheet.
+struct ConnectToMenu: View {
+    @ObservedObject var receiver: StreamReceiver
+    /// Called after a choice, so the cold-open grace period can end at once
+    /// instead of waiting out its countdown.
+    var onChoose: () -> Void = {}
+
+    private var chosenName: String {
+        receiver.knownSenders.first { $0.id == receiver.preferredSenderID }?.displayName
+            ?? "Any Mac"
+    }
+
+    var body: some View {
+        Menu {
+            Picker("Connect to", selection: Binding(
+                get: { receiver.preferredSenderID },
+                set: { receiver.chooseSender($0); onChoose() })) {
+                Text("Any Mac").tag(SenderChoice.anyMac)
+                ForEach(receiver.knownSenders) { sender in
+                    Text(sender.displayName).tag(sender.id)
+                }
+            }
+        } label: {
+            Label("Connect to \(chosenName)", systemImage: "desktopcomputer")
+        }
+        .buttonStyle(.bordered)
+    }
+}
+
 // MARK: - Idle view (no Mac connected) — regular iOS look, follows light/dark
 
 struct IdleView: View {
     @ObservedObject var receiver: StreamReceiver
     @Binding var showSettings: Bool
+    /// True during the cold-open grace period, when listening is deliberately
+    /// held back so a remembered Mac can be chosen before any sender dials in.
+    var choosingInitialMac: Bool = false
+    /// Ends that grace period early once the user has picked a Mac.
+    var onChoose: () -> Void = {}
 
     var body: some View {
         VStack(spacing: 28) {
@@ -288,12 +335,23 @@ struct IdleView: View {
 
             Spacer()
 
-            Button {
-                showSettings = true
-            } label: {
-                Label("Settings & Help", systemImage: "gearshape")
+            HStack(spacing: 12) {
+                Button {
+                    showSettings = true
+                } label: {
+                    Label("Settings & Help", systemImage: "gearshape")
+                }
+                .buttonStyle(.bordered)
+
+                ConnectToMenu(receiver: receiver, onChoose: onChoose)
             }
-            .buttonStyle(.bordered)
+
+            if choosingInitialMac {
+                Text("Listening starts in a few seconds — pick a Mac to connect to it")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+            }
 
             Text("Tip: shake the \(deviceKind) to open settings anytime")
                 .font(.footnote)
@@ -383,6 +441,7 @@ struct SettingsView: View {
     @AppStorage("metalRenderer") private var metalRenderer = false
     @AppStorage("showModifierSidebar") private var showModifierSidebar = false
     @AppStorage("showMacSwitcher") private var showMacSwitcher = true
+    @AppStorage("connectDelaySeconds") private var connectDelaySeconds = 3
     @AppStorage(TouchMode.defaultsKey) private var touchModeRaw = TouchMode.default.rawValue
 
     private var version: String {
@@ -429,10 +488,16 @@ struct SettingsView: View {
                     }
                     Toggle("Switcher button while streaming", isOn: $showMacSwitcher)
                         .disabled(receiver.knownSenders.count < 2)
+                    Picker("Delay before connecting", selection: $connectDelaySeconds) {
+                        Text("Immediately").tag(0)
+                        ForEach(1...5, id: \.self) { seconds in
+                            Text(seconds == 1 ? "1 second" : "\(seconds) seconds").tag(seconds)
+                        }
+                    }
                 } header: {
                     Text("Mac")
                 } footer: {
-                    Text("Macs dial this \(deviceKind), so with two of them running OpenDisplay the first one to connect wins. Pick one here and the others are politely refused and told to retry later — switching back is one tap, and the Mac you left comes back within seconds. “Any Mac” is the original behaviour. The switcher button is a small control in the top corner of the video that does the same thing without opening these settings.")
+                    Text("Choose a Mac to refuse connections from the others. The delay gives you time to choose on opening this app; select Immediately for the fastest connection. The video switcher lets you change Macs during a session.")
                 }
 
                 Section {
@@ -615,6 +680,17 @@ final class ReceiverModel: ObservableObject {
     private var started = false
     private var cancellables = Set<AnyCancellable>()
 
+    /// True while the cold-open grace period is holding the listener back so
+    /// the user can pick a remembered Mac before a sender dials in.
+    @Published private(set) var choosingInitialMac = false
+    /// Whether listening has been started (or is on its way) in this process.
+    /// Gates `sceneDidActivate`'s health check so the activation that
+    /// accompanies a cold launch cannot start the listener behind the grace.
+    private var listeningArmed = false
+    private var initialListeningHealthCheckPending = true
+    private var initialChoiceDeadline: Date?
+    private var initialChoiceTimer: Timer?
+
     init() {
         receiver = StreamReceiver(displayLayer: AVSampleBufferDisplayLayer(),
                                   deviceKind: deviceKind,
@@ -637,9 +713,44 @@ final class ReceiverModel: ObservableObject {
         observeAudioSessionBreaks()
     }
 
-    func start() {
+    func start(delaySeconds: Int) {
         guard !started else { return }
         started = true
+        // Cold open: with a Mac remembered, hold the listener back briefly so
+        // the user can pick which one before a sender dials in and the
+        // first-to-dial race decides it for them. With nothing remembered
+        // there is nothing to choose, so listen at once as before.
+        let delay = TimeInterval(min(max(delaySeconds, 0), 5))
+        guard delay > 0, !receiver.knownSenders.isEmpty else {
+            armListening()
+            return
+        }
+        choosingInitialMac = true
+        initialChoiceDeadline = Date().addingTimeInterval(delay)
+        initialChoiceTimer = Timer.scheduledTimer(
+            withTimeInterval: delay, repeats: false) { [weak self] _ in
+                Task { @MainActor in
+                    if UIApplication.shared.applicationState == .active {
+                        self?.finishInitialChoice()
+                    }
+                }
+            }
+    }
+
+    /// End the cold-open grace period and start listening — early if the user
+    /// picked a Mac, or when the countdown runs out.
+    func finishInitialChoice() {
+        guard choosingInitialMac else { return }
+        choosingInitialMac = false
+        initialChoiceDeadline = nil
+        initialChoiceTimer?.invalidate()
+        initialChoiceTimer = nil
+        initialListeningHealthCheckPending = false
+        armListening()
+    }
+
+    private func armListening() {
+        listeningArmed = true
         receiver.start(port: 9000)
     }
 
@@ -677,6 +788,20 @@ final class ReceiverModel: ObservableObject {
         endBackgroundAssertion()
         configureAudioSession()
         receiver.setRenderingPaused(false)
+        // A foreground during the cold-open grace must not quietly start the
+        // listener — that is exactly the bypass the grace exists to prevent.
+        // If the countdown expired while we were suspended, close it now so a
+        // missed timer cannot leave us never listening; either way, an
+        // ordinary foreground return or a live session is unaffected.
+        if choosingInitialMac, let deadline = initialChoiceDeadline, Date() >= deadline {
+            finishInitialChoice()
+            return
+        }
+        guard listeningArmed else { return }
+        if initialListeningHealthCheckPending {
+            initialListeningHealthCheckPending = false
+            return // start() already queued the first listener bind
+        }
         receiver.ensureListening()
     }
 
@@ -855,6 +980,7 @@ final class ReceiverModel: ObservableObject {
     }
 
     private func goToSleep() {
+        initialListeningHealthCheckPending = false // unlock must recheck the stopped listener
         receiver.enterSleep { [weak self] in
             DispatchQueue.main.async { self?.endBackgroundAssertion() }
         }

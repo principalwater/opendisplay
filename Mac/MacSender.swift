@@ -60,6 +60,8 @@ struct PhoneInfo: Decodable {
     var kind: String { device ?? "device" }
     var protocolVersion: Int { pv ?? WireProtocol.assumedWhenAbsent }
     var wantsAudioSequence: Bool { audioSeq ?? false }
+    let admissionAck: Bool? // receiver confirms its host choice before display setup
+    var requiresAdmission: Bool { admissionAck ?? false }
 }
 
 /// How the sender reaches the receiver. Reconnects re-dial from scratch, so
@@ -331,11 +333,14 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     private func refreshAudioGate() {
         let open = AudioDeliveryPolicy.isActive(connectionReady: connectionReady,
                                                 peerSpeaksTaggedFrames: peerSpeaksTaggedFrames)
+            && (!admissionRequired || admissionGranted)
         audioLock.lock()
         let changed = audioGateOpen != open
         audioGateOpen = open
-        audioGateReason = Self.audioGateReason(connectionReady: connectionReady,
-                                               peerSpeaksTaggedFrames: peerSpeaksTaggedFrames)
+        audioGateReason = admissionRequired && !admissionGranted
+            ? "waiting for receiver admission"
+            : Self.audioGateReason(connectionReady: connectionReady,
+                                   peerSpeaksTaggedFrames: peerSpeaksTaggedFrames)
         let reason = audioGateReason
         audioLock.unlock()
         if changed {
@@ -392,6 +397,9 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
 
     private var lastHello: PhoneInfo?
     private var helloContinuation: CheckedContinuation<PhoneInfo, Error>?
+    private var admissionGranted = false { didSet { refreshAudioGate() } }
+    private var admissionRequired = false { didSet { refreshAudioGate() } }
+    private var admissionContinuation: CheckedContinuation<Void, Error>?
     // The injector is created by the capture setup task, used from the
     // connection's receive queue, and reset from the main actor — three
     // executors, so the *reference* needs its own guard even though the
@@ -716,6 +724,8 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                 Task { await self.status(text) }
             }
             let info = try await waitForHello()
+            if info.requiresAdmission { try await waitForAdmission() }
+            if stopped { return }
             // Before the display, before the encoders, before a single audio
             // packet: may this session exist at all? See `admitSession`.
             let admitted = await MainActor.run { self.admitSession?(info) ?? true }
@@ -724,6 +734,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                     + "another session already serves receiver \(info.id ?? "(unidentified)")")
                 throw SessionSuperseded()
             }
+            if stopped { return }
             try await setupExtend(info)
 
             // Touch back-channel (Milestone 3). Needs Accessibility trust;
@@ -1310,6 +1321,8 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             // Unblock a start() that is still waiting for the hello.
             self?.helloContinuation?.resume(throwing: CancellationError())
             self?.helloContinuation = nil
+            self?.admissionContinuation?.resume(throwing: CancellationError())
+            self?.admissionContinuation = nil
         }
     }
 
@@ -1580,6 +1593,12 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         dialTimeoutLog.reset()
         dialWaitingLog.reset()
         Log.info("connection ready to \(endpointName)")
+        let isNewConnection = readyConnection != ObjectIdentifier(conn)
+        if isNewConnection {
+            admissionGranted = false
+            admissionRequired = false
+            peerSpeaksTaggedFrames = false
+        }
         connectionReady = true
         cursorSeq = 0   // per-session; the receiver rewound its floor with the connection
         // The stats sequence restarts with the connection too (PROTOCOL.md
@@ -1602,10 +1621,8 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         // The receiver's own re-hello triggers (`Shared/StreamReceiver`: panel
         // change, cursor port, address change, unmute) reopen it; nothing
         // should be able to need them.
-        let isNewConnection = readyConnection != ObjectIdentifier(conn)
         readyConnection = ObjectIdentifier(conn)
         if isNewConnection {
-            peerSpeaksTaggedFrames = false
             // Same reasoning, and the same scope: a different receiver may not
             // understand the stamp. It is re-asserted by the next `hello`,
             // which every receiver sends on adoption.
@@ -2795,6 +2812,11 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             return
         }
         switch type {
+        case WireMessage.admitted:
+            admissionGranted = true
+            if let port = lastHello?.cursorPort { openCursorChannel(port: port) }
+            admissionContinuation?.resume()
+            admissionContinuation = nil
         case "ping":
             // Echo with our clock so the phone can estimate the offset
             // (NTP-style) and compute true end-to-end frame latency.
@@ -2815,14 +2837,17 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             if let info = try? JSONDecoder().decode(PhoneInfo.self, from: payload) {
                 let previous = lastHello
                 lastHello = info
+                admissionRequired = info.requiresAdmission
                 // A fresh dial classifies before the hello names the device —
                 // now that it has, decide again (see the comment on the func).
                 if let conn = connection { refreshDirectLinkClassification(for: conn) }
                 Task { @MainActor in self.onHello?(info) }
-                if let port = info.cursorPort {
-                    openCursorChannel(port: port)
-                } else {
-                    closeCursorChannel()
+                if !info.requiresAdmission || admissionGranted {
+                    if let port = info.cursorPort {
+                        openCursorChannel(port: port)
+                    } else {
+                        closeCursorChannel()
+                    }
                 }
                 let addrs = info.addrs ?? []
                 if addrs != peerAddrs {
@@ -3050,6 +3075,20 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                     continuation.resume(returning: hello)
                 } else {
                     self.helloContinuation = continuation
+                }
+            }
+        }
+    }
+
+    private func waitForAdmission() async throws {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            queue.async {
+                if self.stopped {
+                    continuation.resume(throwing: CancellationError())
+                } else if self.admissionGranted {
+                    continuation.resume()
+                } else {
+                    self.admissionContinuation = continuation
                 }
             }
         }

@@ -2,10 +2,9 @@
 
 This branch contains the source used by a Mac sender and an iPad receiver in a
 personal remote-desktop setup. It is based on upstream OpenDisplay v1.21.0 and
-keeps the upstream GPL-3.0 license and attribution. It is source code, not a
-signed release. The branch is published as one commit over upstream so local
-machine names, network details, and development logs are not included in its
-history.
+keeps the upstream GPL-3.0 license and attribution. Signed macOS packages are
+published separately in GitHub Releases. Local machine names, network details,
+and development logs are not included in this branch's history.
 
 ## Added behavior
 
@@ -16,6 +15,10 @@ history.
 - Remote, Extend, and Mirror layouts; 120 Hz default where the receiver and
   path support it; adaptive quality and congestion handling.
 - Sender and receiver admission, reconnection, and cable/LAN deduplication.
+  The receiver checks the chosen Mac before replacing a live session, and the
+  sender waits for its admission before creating a virtual display. Its idle
+  screen offers the Mac picker, with a 3-second startup delay by default;
+  iPad settings can change the delay to immediate or 1–5 seconds.
 - Tests for the input, audio, display, transport, and protocol paths.
 
 The fork gives the Mac sender and iOS receiver distinct bundle identifiers:
