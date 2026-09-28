@@ -2545,6 +2545,7 @@ struct VideoLayerView: UIViewRepresentable {
 
         override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
             ensureKeyboardFocus()
+            if let event { receiver?.sendModifierSnapshot(UInt(event.modifierFlags.rawValue)) }
             noteNativeTouchDown(touches, event)
             routeTouches("began", touches, event, ended: false)
         }

@@ -29,11 +29,15 @@ final class KeyboardInjectionTests: XCTestCase {
         func tickAfterCancel() { cancelledFire?() }
     }
 
-    private func makeInjector(remap: CommandKeyRemap = .rightOption) -> InputInjector {
+    private func makeInjector(remap: CommandKeyRemap = .rightOption,
+                              escapeKey: EscapeKeySource = .fallback) -> InputInjector {
         sink = RecordingEventSink()
         scheduler = ManualRepeatScheduler()
         return InputInjector(displayID: CGMainDisplayID(), sink: sink,
                              commandKeyRemap: remap,
+                             keyRemapPlan: KeyRemapPlan.resolve(escapeKey: escapeKey,
+                                                                globeKey: .switchLanguage,
+                                                                languageKey: .none),
                              keyRepeat: KeyRepeatController(scheduler: scheduler,
                                                             delay: { 0.4 }, interval: { 0.05 }))
     }
@@ -105,6 +109,74 @@ final class KeyboardInjectionTests: XCTestCase {
         sink.reset()
         injector.handleKey(hidUsage: 0x04, down: true, rawModifiers: KeyboardMap.uiShift)
         XCTAssertTrue(sink.events.first?.flags.contains(.maskShift) ?? false)
+    }
+
+    func testTouchSnapshotReleasesARemappedCommandWhoseKeyUpWasLost() {
+        let injector = makeInjector(remap: .leftOption)
+        injector.handleKey(hidUsage: KeyboardMap.HID.leftOption, down: true,
+                           rawModifiers: KeyboardMap.uiAlternate)
+        sink.reset()
+
+        injector.reconcileModifiers(reported: 0)
+
+        XCTAssertEqual(sink.events.map(\.type), [.flagsChanged])
+        XCTAssertEqual(sink.events.first?.keyCode, 0x37)
+        XCTAssertFalse(sink.events.first?.flags.contains(.maskCommand) ?? true)
+        sink.reset()
+        injector.handleKey(hidUsage: 0x04, down: true)
+        XCTAssertFalse(sink.events.first?.flags.contains(.maskCommand) ?? true)
+    }
+
+    func testTouchSnapshotKeepsAModifierStillHeldForModifiedClick() {
+        let injector = makeInjector(remap: .leftOption)
+        injector.handleKey(hidUsage: KeyboardMap.HID.leftOption, down: true,
+                           rawModifiers: KeyboardMap.uiAlternate)
+        sink.reset()
+
+        injector.reconcileModifiers(reported: KeyboardMap.uiAlternate)
+
+        XCTAssertTrue(sink.events.isEmpty)
+        injector.handleKey(hidUsage: 0x04, down: true,
+                           rawModifiers: KeyboardMap.uiAlternate)
+        XCTAssertTrue(sink.events.first?.flags.contains(.maskCommand) ?? false)
+    }
+
+    func testSwappedLeftModifiersProduceCommandOptionArrow() {
+        let injector = makeInjector(remap: .swapLeftOptionCommand)
+        injector.handleKey(hidUsage: KeyboardMap.HID.leftOption, down: true,
+                           rawModifiers: KeyboardMap.uiAlternate)
+        injector.handleKey(hidUsage: KeyboardMap.HID.leftCommand, down: true,
+                           rawModifiers: KeyboardMap.uiAlternate | KeyboardMap.uiCommand)
+        sink.reset()
+
+        injector.handleKey(hidUsage: 0x4F, down: true,
+                           rawModifiers: KeyboardMap.uiAlternate | KeyboardMap.uiCommand)
+
+        XCTAssertEqual(sink.events.first?.keyCode, 0x7C)
+        XCTAssertTrue(sink.events.first?.flags.contains(.maskCommand) ?? false)
+        XCTAssertTrue(sink.events.first?.flags.contains(.maskAlternate) ?? false)
+    }
+
+    func testControlGraveLeavesCommandGraveForWindowCycling() {
+        let injector = makeInjector(remap: .swapLeftOptionCommand, escapeKey: .controlGrave)
+        injector.handleKey(hidUsage: KeyboardMap.HID.leftOption, down: true,
+                           rawModifiers: KeyboardMap.uiAlternate)
+        sink.reset()
+        injector.handleKey(hidUsage: KeyboardMap.HID.grave, down: true,
+                           rawModifiers: KeyboardMap.uiAlternate)
+        XCTAssertEqual(sink.events.first?.keyCode, 0x32)
+        XCTAssertTrue(sink.events.first?.flags.contains(.maskCommand) ?? false)
+
+        injector.handleKey(hidUsage: KeyboardMap.HID.grave, down: false,
+                           rawModifiers: KeyboardMap.uiAlternate)
+        injector.handleKey(hidUsage: KeyboardMap.HID.leftOption, down: false)
+        injector.handleKey(hidUsage: KeyboardMap.HID.leftControl, down: true,
+                           rawModifiers: KeyboardMap.uiControl)
+        sink.reset()
+        injector.handleKey(hidUsage: KeyboardMap.HID.grave, down: true,
+                           rawModifiers: KeyboardMap.uiControl)
+        XCTAssertEqual(sink.events.map(\.keyCode), [0x35, 0x35])
+        XCTAssertTrue(sink.events.allSatisfy { !$0.flags.contains(.maskControl) })
     }
 
     func testCapsLockIsCarriedAsAFlagAndNotInjectedAsAKey() {

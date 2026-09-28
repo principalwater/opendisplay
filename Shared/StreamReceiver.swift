@@ -1489,6 +1489,13 @@ final class StreamReceiver: ObservableObject {
         sendControl(msg)
     }
 
+    /// Sends the current physical modifier state before a touch can click.
+    /// This repairs a lost UIKit key-up without clearing a modifier still held
+    /// for a deliberate modified click. Older senders ignore this message.
+    func sendModifierSnapshot(_ flags: UInt) {
+        sendControl(["type": "modifierSnapshot", "mod": flags])
+    }
+
     /// Scroll: dx/dy in video pixels (natural-scrolling sign).
     ///
     /// `phase` is additive and optional (PROTOCOL.md 6.1). Omitted, this is the

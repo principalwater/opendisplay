@@ -15,7 +15,7 @@ import Foundation
 /// keys, Caps-Lock handling and every ⌘-shortcut. `UIKey.characters` is only
 /// used for usages with no virtual keycode at all (see InputInjector).
 ///
-/// Which physical Option key — if any — the Mac sender turns into Command.
+/// How the Mac sender maps physical Option and Command keys.
 ///
 /// The Sunshine `key_rightalt_to_key_win` habit, made selectable. iPadOS keeps
 /// a long list of ⌘ chords for itself (⌘Tab, ⌘Space, ⌘H, ⌘⇧3/4, Globe combos)
@@ -32,7 +32,7 @@ import Foundation
 /// ```
 ///
 /// **Precedence**, highest first:
-///   1. `commandKeyRemap`, when present and one of the four values below;
+///   1. `commandKeyRemap`, when present and one of the values below;
 ///   2. the legacy boolean `remapRightOptionToCommand`, when present —
 ///      `true` → `.rightOption`, `false` → `.none`;
 ///   3. `.rightOption`, the behaviour this fork shipped before the setting
@@ -57,6 +57,9 @@ enum CommandKeyRemap: String, CaseIterable, Sendable {
     /// Both Option keys → Command. No Option key is left on the keyboard.
     case bothOptions
 
+    /// Swap the left Option and Command keys, keeping both modifiers reachable.
+    case swapLeftOptionCommand
+
     static let defaultsKey = "commandKeyRemap"
     static let legacyDefaultsKey = "remapRightOptionToCommand"
 
@@ -64,11 +67,13 @@ enum CommandKeyRemap: String, CaseIterable, Sendable {
     /// behaviour, so an upgrade changes nothing for an existing user.
     static let fallback: CommandKeyRemap = .rightOption
 
-    var remapsLeftOption: Bool { self == .leftOption || self == .bothOptions }
+    var remapsLeftOption: Bool {
+        self == .leftOption || self == .bothOptions || self == .swapLeftOptionCommand
+    }
     var remapsRightOption: Bool { self == .rightOption || self == .bothOptions }
+    var remapsLeftCommand: Bool { self == .swapLeftOptionCommand }
 
-    /// True when this HID usage is an Option key that now stands in for
-    /// Command. False for every non-Option usage.
+    /// Whether this physical Option key stands in for Command.
     func remapsToCommand(_ hidUsage: UInt16) -> Bool {
         switch hidUsage {
         case KeyboardMap.HID.leftOption:  return remapsLeftOption
@@ -84,6 +89,7 @@ enum CommandKeyRemap: String, CaseIterable, Sendable {
         case .leftOption:  return "Left Option"
         case .rightOption: return "Right Option"
         case .bothOptions: return "Both Options"
+        case .swapLeftOptionCommand: return "Swap left Option and Command"
         }
     }
 
@@ -100,6 +106,8 @@ enum CommandKeyRemap: String, CaseIterable, Sendable {
             return "Right Option on the device's keyboard arrives as Command; left Option stays Option. Applies to the next session."
         case .bothOptions:
             return "Both Option keys on the device's keyboard arrive as Command; no Option key is left. Applies to the next session."
+        case .swapLeftOptionCommand:
+            return "Left Option arrives as Command and left Command as Option, so both modifiers remain available together. Applies to the next session."
         }
     }
 
@@ -222,7 +230,10 @@ enum KeyboardMap {
             return commandKeyRemap.remapsRightOption
                 ? CGEventFlags(rawValue: CGEventFlags.maskCommand.rawValue | DeviceBits.rightCommand)
                 : CGEventFlags(rawValue: CGEventFlags.maskAlternate.rawValue | DeviceBits.rightOption)
-        case HID.leftCommand:  return CGEventFlags(rawValue: CGEventFlags.maskCommand.rawValue | DeviceBits.leftCommand)
+        case HID.leftCommand:
+            return commandKeyRemap.remapsLeftCommand
+                ? CGEventFlags(rawValue: CGEventFlags.maskAlternate.rawValue | DeviceBits.leftOption)
+                : CGEventFlags(rawValue: CGEventFlags.maskCommand.rawValue | DeviceBits.leftCommand)
         case HID.rightCommand: return CGEventFlags(rawValue: CGEventFlags.maskCommand.rawValue | DeviceBits.rightCommand)
         default: return []
         }
@@ -256,6 +267,8 @@ enum KeyboardMap {
             return 0x37   // kVK_Command
         case HID.rightOption where commandKeyRemap.remapsRightOption:
             return 0x36   // kVK_RightCommand
+        case HID.leftCommand where commandKeyRemap.remapsLeftCommand:
+            return 0x3A   // kVK_Option
         default:
             return macKeyCode(for: hidUsage)
         }
@@ -454,6 +467,28 @@ struct ModifierKeyState {
 
     mutating func clear() { held.removeAll() }
 
+    /// Returns held modifiers absent from a later UIKit event's physical-key snapshot.
+    /// UIKit reports a modifier category, not its side, so a held key is only
+    /// released when neither key in that category is reported as pressed.
+    func missing(from reported: UInt) -> [UInt16] {
+        held.filter { usage in
+            let mask: UInt
+            switch usage {
+            case KeyboardMap.HID.leftControl, KeyboardMap.HID.rightControl:
+                mask = KeyboardMap.uiControl
+            case KeyboardMap.HID.leftShift, KeyboardMap.HID.rightShift:
+                mask = KeyboardMap.uiShift
+            case KeyboardMap.HID.leftOption, KeyboardMap.HID.rightOption:
+                mask = KeyboardMap.uiAlternate
+            case KeyboardMap.HID.leftCommand, KeyboardMap.HID.rightCommand:
+                mask = KeyboardMap.uiCommand
+            default:
+                return false
+            }
+            return reported & mask == 0
+        }.sorted()
+    }
+
     /// Flags to stamp on an injected event.
     ///
     /// - `reported`: the `mod` field from the wire (UIKeyModifierFlags bits).
@@ -479,24 +514,29 @@ struct ModifierKeyState {
             flags.formUnion(KeyboardMap.flags(forModifier: usage,
                                               commandKeyRemap: commandKeyRemap))
         }
-        let reportedFlags = KeyboardMap.eventFlags(for: reported)
+        var reportedFlags = KeyboardMap.eventFlags(for: reported)
         if includeReported {
-            flags.formUnion(reportedFlags)
             // The iPad has one `.alternate` bit for *both* Option keys, so the
-            // bit just unioned in is only ever a re-report of an Option key
-            // this state already knows about. Drop it precisely when every
+            // reported bit is only ever a re-report of an Option key
+            // this state already knows about. Drop it when every
             // Option physically held is one that now means Command; if a
-            // non-remapped Option is down too, the user really is holding
-            // Option and the bit stays (alongside the Command the remapped one
-            // contributes). With no Option held at all nothing is removed —
+            // non-remapped Option is down too, it stays. The same rule applies
+            // to Command in swap mode. With no key held nothing is removed —
             // the reported bit then comes from a key pressed while the video
             // view was not first responder, and guessing it away would lose it.
             let heldOptions = held.intersection(KeyboardMap.HID.optionKeys)
             if !heldOptions.isEmpty,
                heldOptions.allSatisfy(commandKeyRemap.remapsToCommand) {
-                flags.remove(.maskAlternate)
-                flags.insert(.maskCommand)
+                reportedFlags.remove(.maskAlternate)
             }
+            let heldCommands = held.intersection([KeyboardMap.HID.leftCommand,
+                                                  KeyboardMap.HID.rightCommand])
+            if !heldCommands.isEmpty,
+               heldCommands.allSatisfy({ $0 == KeyboardMap.HID.leftCommand
+                                         && commandKeyRemap.remapsLeftCommand }) {
+                reportedFlags.remove(.maskCommand)
+            }
+            flags.formUnion(reportedFlags)
         }
         // Caps Lock is a latch, not a held key: it is only ever reported.
         if reportedFlags.contains(.maskAlphaShift) { flags.insert(.maskAlphaShift) }

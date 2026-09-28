@@ -486,6 +486,23 @@ final class InputInjector {
         withState { stickyModifiers = Self.eventFlags(for: rawFlags) }
     }
 
+    /// Releases a modifier whose key-up was lost to iPadOS before a new touch.
+    /// The snapshot is the touch event's physical keyboard state; unlike a
+    /// timeout it keeps a deliberately held modifier available for a click.
+    func reconcileModifiers(reported rawModifiers: UInt) {
+        withState {
+            for usage in modifiers.missing(from: rawModifiers) {
+                modifiers.update(hidUsage: usage, down: false)
+                guard let key = KeyboardMap.macKeyCode(for: usage,
+                                                       commandKeyRemap: commandKeyRemap) else { continue }
+                let flags = modifiers.flags(reported: 0, includeReported: false,
+                                            commandKeyRemap: commandKeyRemap)
+                post(virtualKey: key, down: false, flags: flags,
+                     isModifier: true, autorepeat: false)
+            }
+        }
+    }
+
     /// Injects one key transition from the iPad's hardware keyboard (issue #6).
     ///
     /// - `hidUsage`: USB HID Keyboard/Keypad usage page (0x07) code, i.e.
@@ -534,14 +551,15 @@ final class InputInjector {
         // remapped one.
         if keyRemapPlan.claimsCapsLock { flags.subtract(.maskAlphaShift) }
 
-        // The ⌘` chord is decided on the **down edge only**, and its release is
+        // A grave-key Escape chord is decided on the **down edge only**, and its release is
         // swallowed. Deciding it again on the way up would be wrong in both
         // directions: a user who presses ` and *then* Command would get a
         // stray Escape and a backtick left held down on the Mac, and a user who
         // releases Command before ` would get a backtick released that was
         // never pressed.
         if hidUsage == KeyboardMap.HID.grave,
-           keyRemapPlan.graveRule == .commandChordIsEscape {
+           keyRemapPlan.graveRule == .commandChordIsEscape
+            || keyRemapPlan.graveRule == .controlChordIsEscape {
             if !down, graveChordConsumed {
                 graveChordConsumed = false
                 return
@@ -559,17 +577,19 @@ final class InputInjector {
                                    // Command *after* normalization, so a
                                    // `commandKeyRemap`ped Option counts — see
                                    // `EscapeKeySource.leftCommandGrave`.
-                                   command: down && flags.contains(.maskCommand)) {
+                                   command: down && flags.contains(.maskCommand),
+                                   control: down && flags.contains(.maskControl)) {
         case .escape:
             postRemappedEscape(from: hidUsage, down: down, flags: flags)
             return
-        case .escapeWithoutCommand:
-            // Down + up in one go, with Command removed. No auto-repeat: the
+        case .escapeWithoutCommand, .escapeWithoutControl:
+            // Down + up in one go, with the shortcut modifier removed. No auto-repeat: the
             // release is swallowed, so a repeat started here would have nothing
             // left to stop it.
             graveChordConsumed = true
             let vk = KeyboardMap.macKeyCode(for: KeyboardMap.HID.escape) ?? 0x35
-            let clean = flags.subtracting(.maskCommand)
+            let clean = flags.subtracting(keyRemapPlan.graveRule == .controlChordIsEscape
+                                          ? .maskControl : .maskCommand)
             post(virtualKey: vk, down: true, flags: clean, isModifier: false, autorepeat: false)
             post(virtualKey: vk, down: false, flags: clean, isModifier: false, autorepeat: false)
             return

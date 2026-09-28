@@ -2914,6 +2914,10 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                     }
                 }
             }
+        case "modifierSnapshot":
+            if let raw = obj["mod"] as? Int {
+                inputInjector?.reconcileModifiers(reported: WireInput.modifierMask(raw))
+            }
         case "touch":
             if let phase = obj["phase"] as? String,
                let x = obj["x"] as? Double,

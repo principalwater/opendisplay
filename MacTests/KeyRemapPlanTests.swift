@@ -260,6 +260,17 @@ final class KeyRemapPlanTests: XCTestCase {
                        .escapeWithoutCommand)
     }
 
+    func testControlGraveReservesOnlyControlForEscape() {
+        let plan = KeyRemapPlan.resolve(escapeKey: .controlGrave,
+                                        globeKey: .switchLanguage, languageKey: .none)
+        XCTAssertEqual(plan.action(for: KeyboardMap.HID.grave, shift: false,
+                                   option: false, control: true), .escapeWithoutControl)
+        XCTAssertEqual(plan.action(for: KeyboardMap.HID.grave, shift: false,
+                                   option: false, command: true), .unchanged)
+        XCTAssertEqual(plan.action(for: KeyboardMap.HID.grave, shift: false,
+                                   option: false), .unchanged)
+    }
+
     func testTheBacktickKeepsBothOfItsCharacters() {
         // This is what `escapeKey grave` had to buy with Shift and Option
         // rules, and what a chord gets for nothing.

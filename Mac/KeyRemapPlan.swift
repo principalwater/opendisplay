@@ -75,6 +75,9 @@ enum EscapeKeySource: String, CaseIterable, Sendable {
     /// modifier sidebar.
     case leftCommandGrave
 
+    /// Control+` sends Escape while Command+` remains available to macOS.
+    case controlGrave
+
     static let defaultsKey = "escapeKey"
     static let fallback: EscapeKeySource = .leftCommandGrave
 
@@ -84,7 +87,7 @@ enum EscapeKeySource: String, CaseIterable, Sendable {
         case .none:     return nil
         case .globe:    return KeyboardMap.HID.globe
         case .capsLock: return KeyboardMap.HID.capsLock
-        case .grave, .leftCommandGrave: return KeyboardMap.HID.grave
+        case .grave, .leftCommandGrave, .controlGrave: return KeyboardMap.HID.grave
         }
     }
 
@@ -94,6 +97,7 @@ enum EscapeKeySource: String, CaseIterable, Sendable {
         case .none, .globe, .capsLock: return .none
         case .grave:                   return .plainIsEscape
         case .leftCommandGrave:        return .commandChordIsEscape
+        case .controlGrave:            return .controlChordIsEscape
         }
     }
 
@@ -104,6 +108,7 @@ enum EscapeKeySource: String, CaseIterable, Sendable {
         case .capsLock:         return "Caps Lock"
         case .grave:            return "Backtick (`)"
         case .leftCommandGrave: return "Command + ` "
+        case .controlGrave:     return "Control + ` "
         }
     }
 
@@ -119,6 +124,8 @@ enum EscapeKeySource: String, CaseIterable, Sendable {
             return "` sends Escape; Shift+` still types ~ and Option+` still types a literal `. Applies to the next session."
         case .leftCommandGrave:
             return "Command+` sends Escape and never reaches this Mac as ⌘` (no window cycling). A plain ` still types a backtick and Shift+` a tilde. iPadOS may reserve ⌘` for itself — if the chord does nothing, press the Option key that \"Command key\" above turns into Command instead; iPadOS reserves neither Option key. Applies to the next session."
+        case .controlGrave:
+            return "Control+` sends Escape. Command+` remains available for switching Mac windows; plain ` and Shift+` keep their characters. Applies to the next session."
         }
     }
 
@@ -282,6 +289,8 @@ struct KeyRemapPlan: Equatable {
         /// `escapeKey leftCommandGrave` — ⌘` is Escape and never reaches the
         /// Mac as ⌘`; a bare `` ` `` and ⇧`` ` `` are completely untouched.
         case commandChordIsEscape
+        /// `escapeKey controlGrave` leaves Command+` available to applications.
+        case controlChordIsEscape
     }
 
     /// The usage that produces Escape, if any.
@@ -300,6 +309,8 @@ struct KeyRemapPlan: Equatable {
         /// release. The `⌘`` chord: the Mac must see an Escape, and must never
         /// see ⌘` (which cycles an application's windows).
         case escapeWithoutCommand
+        /// Post Escape without Control, swallowing the grave key's release.
+        case escapeWithoutControl
         /// Cycle the Mac's input source; post no key.
         case switchInputSource
         /// The key itself, with the Option flag removed (the `⌥`` rule).
@@ -364,7 +375,7 @@ struct KeyRemapPlan: Equatable {
 
     /// `globeKey == .escape` while `escapeKey` names some other key.
     let alsoEscapeFromGlobe: Bool
-    /// What the backtick key does. Both `grave` and `leftCommandGrave` claim
+    /// What the backtick key does. The grave escape options claim
     /// the same usage, so `escapeFrom` alone cannot say which rule applies.
     let graveRule: GraveRule
 
@@ -384,7 +395,7 @@ struct KeyRemapPlan: Equatable {
     /// been applied" — so a remapped Option satisfies it, which is what makes
     /// the chord reachable on a keyboard whose ⌘` iPadOS eats.
     func action(for hidUsage: UInt16, shift: Bool, option: Bool,
-                command: Bool = false) -> Action {
+                command: Bool = false, control: Bool = false) -> Action {
         if hidUsage == KeyboardMap.HID.grave {
             switch graveRule {
             case .commandChordIsEscape:
@@ -392,6 +403,8 @@ struct KeyRemapPlan: Equatable {
                 // the backtick, the tilde, ⌥`, ⌃` — is left exactly as it was,
                 // which is why this option costs nothing.
                 return command ? .escapeWithoutCommand : .unchanged
+            case .controlChordIsEscape:
+                return control ? .escapeWithoutControl : .unchanged
             case .plainIsEscape:
                 switch GraveAction.resolve(shift: shift, option: option) {
                 case .escape: return .escape
@@ -426,6 +439,8 @@ struct KeyRemapPlan: Equatable {
         var parts: [String] = []
         if graveRule == .commandChordIsEscape {
             parts.append("Escape from Command + HID 0x35 (⌘`, which never reaches this Mac as ⌘`)")
+        } else if graveRule == .controlChordIsEscape {
+            parts.append("Escape from Control + HID 0x35")
         } else {
             parts.append(escapeFrom.map { "Escape from HID 0x\(String($0, radix: 16))" }
                          ?? "no Escape key")
