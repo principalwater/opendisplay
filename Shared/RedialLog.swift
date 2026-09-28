@@ -1,6 +1,6 @@
 import Foundation
 
-/// How often a dial that cannot reach its receiver is allowed to say so.
+/// How often a repeated connection event is allowed to say so.
 ///
 /// A sender with a `-host` endpoint retries forever, and it should: that is
 /// the remote path, and an iPad that comes back has to be picked up. What it
@@ -11,7 +11,8 @@ import Foundation
 /// On alfheim-home that was essentially the whole idle log, and
 /// `opendisplay-watchdog` reads only the last 200 lines to find its
 /// `rejected-by-receiver until=` marker, so the flood crowds out the one line
-/// it is looking for.
+/// it is looking for. The receiver also rejects an unselected sender every
+/// two seconds while awaiting a host switch; it uses this same throttle.
 ///
 /// The first few attempts are worth seeing — someone watching a reconnect is
 /// reading them. After that the news is not "it failed again" but "it has been

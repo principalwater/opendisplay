@@ -107,6 +107,9 @@ final class StreamReceiver: ObservableObject {
     /// Consecutive listener failures, for the backoff. Reset on `.ready`.
     private var listenerFailures = 0
     private var cursorListenerFailures = 0
+    /// Rejected senders redial frequently so a host choice takes effect promptly.
+    /// Keep their repeated refusals from displacing useful receiver diagnostics.
+    private var refusalLog = RedialLogThrottle()
     private var connection: NWConnection?
     /// Whether this connection's sender tags its frames (protocol 4+).
     ///
@@ -998,6 +1001,7 @@ final class StreamReceiver: ObservableObject {
             case .adopt(let type):
                 proof.settled = true
                 self.pendingConnections.removeAll { $0 === conn }
+                self.refusalLog.reset()
                 // The transport label belongs to the session, so it is set when
                 // there *is* one: a probe from a loopback forwarder used to
                 // relabel a live WiFi session "USB" on the way past.
@@ -1022,8 +1026,17 @@ final class StreamReceiver: ObservableObject {
                         self.knownSenders = SenderChoice.merge(self.knownSenders, seen: sender)
                     }
                 }
-                Log.info("admission: \(peer) refused before adoption — \(reason)"
-                         + (hadSession ? "; the live session is untouched" : ""))
+                let topic = "\(sender?.id ?? "unidentified"):\(reason)"
+                switch self.refusalLog.note(topic, now: Date().timeIntervalSince1970) {
+                case .speak:
+                    Log.info("admission: \(peer) refused before adoption — \(reason)"
+                             + (hadSession ? "; the live session is untouched" : ""))
+                case .summarise(let suppressed):
+                    Log.info("admission: \(sender?.displayName ?? peer) still refused — \(reason); "
+                             + "\(suppressed) repeat attempts since the last report")
+                case .quiet:
+                    break
+                }
                 var finished = false
                 let finish = {
                     guard !finished else { return }

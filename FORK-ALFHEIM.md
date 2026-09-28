@@ -17,11 +17,13 @@ credentials, and development logs are not included in this branch.
 - System audio streaming with optional host-speaker silencing tied to the
   actual audio delivery gate.
 - Remote, Extend, and Mirror layouts; 120 Hz default where the receiver and
-  path support it; adaptive quality and congestion handling. Routed sessions
-  start conservatively and probe upward when frames flow without congestion.
+  path support it; adaptive quality and congestion handling. Recognized
+  tailnet sessions start conservatively and probe upward when frames flow
+  without congestion; an RTT reading alone does not cap local Wi-Fi.
 - Sender and receiver admission, reconnection, and cable/LAN deduplication.
   The receiver checks the chosen Mac before replacing a live session, and the
-  sender waits for its admission before creating a virtual display. Its idle
+  sender waits for its admission before creating a virtual display. Repeated
+  refusals are summarized in the receiver log while retrying. Its idle
   screen offers the Mac picker, with a 3-second startup delay by default;
   iPad settings can change the delay to immediate or 1–5 seconds.
 - Tests for the input, audio, display, transport, and protocol paths.

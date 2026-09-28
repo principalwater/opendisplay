@@ -199,7 +199,7 @@ targets:
       - Shared/StatsChannel.swift
       - Mac/SessionDedupe.swift
       # Pure: how often a dial that cannot reach its receiver may say so.
-      - Mac/RedialLog.swift
+      - Shared/RedialLog.swift
       - Mac/SessionLayout.swift
       - Mac/WindowGather.swift
       - Shared/SenderIdentity.swift
