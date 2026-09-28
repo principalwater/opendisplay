@@ -11,9 +11,7 @@ import XCTest
 final class ConnectionAdmissionTests: XCTestCase {
 
     /// A frame exactly as a sender writes it: 4-byte big-endian length, then
-    /// the JSON. `welcome` is untagged by protocol rule (PROTOCOL.md 5) — the
-    /// receiver cannot know the sender's version until it has read this very
-    /// message — which is what lets the test need no negotiated state.
+    /// the JSON. `welcome` is untagged by protocol rule (PROTOCOL.md 5).
     private func frame(_ json: String, tagged: Bool = false) -> Data {
         let payload = Data(json.utf8)
         let body = tagged ? Data([FrameType.json.rawValue]) + payload : payload
@@ -39,6 +37,57 @@ final class ConnectionAdmissionTests: XCTestCase {
         // for ourselves.
         XCTAssertEqual(ConnectionAdmission.judge(buffered: frame(welcome, tagged: true)),
                        .adopt(type: "welcome"))
+    }
+
+    func testAnotherMacIsRefusedBeforeItCanReplaceTheSession() {
+        let studio = frame(#"{"type":"welcome","senderID":"studio","host":"Mac Studio"}"#)
+        XCTAssertEqual(ConnectionAdmission.judge(buffered: studio,
+                                                 preferredSenderID: "macbook"),
+                       .refuse(reason: RejectionMessage.reasonOtherMacSelected,
+                               sender: SenderIdentity(id: "studio", host: "Mac Studio")))
+        XCTAssertEqual(ConnectionAdmission.judge(buffered: studio,
+                                                 preferredSenderID: "studio"),
+                       .adopt(type: "welcome"))
+        XCTAssertEqual(ConnectionAdmission.judge(buffered: frame(welcome),
+                                                 preferredSenderID: "macbook"),
+                       .refuse(reason: RejectionMessage.reasonOtherMacSelected, sender: nil))
+        XCTAssertEqual(ConnectionAdmission.judge(buffered: frame(#"{"type":"ping","senderID":"studio"}"#),
+                                                 preferredSenderID: "macbook"), .keepReading)
+    }
+
+    func testChosenMacCanSendOtherFramesBeforeWelcome() {
+        var proof = ConnectionAdmission.Proof()
+        let ping = frame(#"{"type":"ping"}"#)
+        let macbook = frame(#"{"type":"welcome","senderID":"macbook"}"#)
+        XCTAssertEqual(proof.read(Data(ping.prefix(3)), preferredSenderID: "macbook"), .keepReading)
+        XCTAssertEqual(proof.read(Data(ping.dropFirst(3)) + Data(macbook.prefix(5)),
+                                  preferredSenderID: "macbook"), .keepReading)
+        XCTAssertEqual(proof.read(Data(macbook.dropFirst(5)), preferredSenderID: "macbook"),
+                       .adopt(type: "welcome"))
+        XCTAssertEqual(proof.buffered, ping + macbook)
+
+        var rival = ConnectionAdmission.Proof()
+        let studio = frame(#"{"type":"welcome","senderID":"studio","host":"Mac Studio"}"#)
+        XCTAssertEqual(rival.read(ping + studio, preferredSenderID: "macbook"),
+                       .refuse(reason: RejectionMessage.reasonOtherMacSelected,
+                               sender: SenderIdentity(id: "studio", host: "Mac Studio")))
+    }
+
+    func testLargePreWelcomeFrameIsSkippedWithoutBuffering() {
+        var frame = Data()
+        var length = UInt32(100_000).bigEndian
+        withUnsafeBytes(of: &length) { frame.append(contentsOf: $0) }
+        frame.append(Data(repeating: 0x65, count: 100_000))
+        let welcome = self.frame(#"{"type":"welcome","senderID":"macbook"}"#)
+        var proof = ConnectionAdmission.Proof()
+        XCTAssertEqual(proof.read(Data(frame.prefix(20)), preferredSenderID: "macbook"), .keepReading)
+        XCTAssertTrue(proof.buffered.isEmpty)
+        XCTAssertEqual(proof.read(Data(frame.dropFirst(20).prefix(50_000)),
+                                  preferredSenderID: "macbook"), .keepReading)
+        XCTAssertEqual(proof.read(Data(frame.dropFirst(50_020)) + welcome,
+                                  preferredSenderID: "macbook"), .adopt(type: "welcome"))
+        XCTAssertEqual(proof.buffered, welcome)
+        XCTAssertTrue(proof.droppedVideo)
     }
 
     func testAPartialFrameIsNotYetAVerdict() {
@@ -93,6 +142,10 @@ final class ConnectionAdmissionTests: XCTestCase {
         out.append(Data(repeating: 0x41, count: 16))
         XCTAssertNil(ConnectionAdmission.greetingType(in: out))
         XCTAssertEqual(ConnectionAdmission.judge(buffered: out), .keepReading)
+        guard case .reject = ConnectionAdmission.judge(buffered: out,
+                                                      preferredSenderID: "macbook") else {
+            return XCTFail("a chosen-Mac proof must reject an impossible frame length")
+        }
     }
 
     func testAFloodIsCutOffRatherThanBuffered() {
