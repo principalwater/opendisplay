@@ -811,14 +811,24 @@ struct AdaptiveQualityController {
     mutating func reclassify(as newClass: PathClass, remembered: OperatingPoint?) -> Bool {
         guard newClass != pathClass else { return false }
         pathClass = newClass
-        guard !hasDecided, let remembered else { return false }
-        targetBps = Self.startTarget(remembered.targetKbps * 1000,
-                                    pathClass: newClass, plan: plan)
-        levelIndex = max(min(max(0, remembered.levelIndex), plan.levels.count - 1),
-                         plan.viableIndex(targetBps: targetBps))
-        estimator = DeliveredRateEstimator()
-        estimator.seed(Double(targetBps) / Self.targetShareOfEstimate)
+        guard !hasDecided else { return false }
+        let previousTarget = targetBps
+        let previousLevel = levelIndex
+        if let remembered {
+            targetBps = Self.startTarget(remembered.targetKbps * 1000,
+                                        pathClass: newClass, plan: plan)
+            levelIndex = max(min(max(0, remembered.levelIndex), plan.levels.count - 1),
+                             plan.viableIndex(targetBps: targetBps))
+        } else if newClass != .lan {
+            // A connection can first look local before its routed endpoint is
+            // known. Even without a saved point, correct that optimistic start.
+            targetBps = Self.startTarget(targetBps, pathClass: newClass, plan: plan)
+            levelIndex = max(levelIndex, plan.viableIndex(targetBps: targetBps))
+        }
         startupProbing = newClass != .lan && targetBps < plan.configuredBitrateBps
+        guard targetBps != previousTarget || levelIndex != previousLevel else { return false }
+        estimator = DeliveredRateEstimator()
+        if remembered != nil { estimator.seed(Double(targetBps) / Self.targetShareOfEstimate) }
         return true
     }
 

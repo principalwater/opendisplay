@@ -650,6 +650,14 @@ final class AdaptiveQualityTests: XCTestCase {
         XCTAssertEqual(controller.level.frameRateCap, 30)
     }
 
+    func testLateTailnetClassificationCapsAnUnrememberedLocalStart() {
+        var controller = self.controller(pathClass: .lan)
+        XCTAssertEqual(controller.targetBps, 28_800_000)
+        XCTAssertTrue(controller.reclassify(as: .tailnetLowRTT, remembered: nil))
+        XCTAssertEqual(controller.targetBps, 4_000_000)
+        XCTAssertEqual(controller.level.frameRateCap, 30)
+    }
+
     func testTailnetProbesRapidlyWhileFramesAreFlowingAndTheLinkIsClean() {
         var controller = self.controller(pathClass: .tailnetLowRTT)
         var targets: [Int] = []
