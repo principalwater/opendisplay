@@ -753,6 +753,7 @@ struct AdaptiveQualityController {
 
     let plan: AdaptivePlan
     private(set) var pathClass: PathClass
+    private var knownTailnetEndpoint: Bool
     private(set) var targetBps: Int
     private(set) var levelIndex: Int
     private(set) var estimator: DeliveredRateEstimator
@@ -773,23 +774,26 @@ struct AdaptiveQualityController {
     var level: QualityLevel { plan.levels[min(levelIndex, plan.levels.count - 1)] }
     var estimateBps: Int { Int(estimator.estimateBps.rounded()) }
 
-    init(plan: AdaptivePlan, pathClass: PathClass, start: OperatingPoint?,
+    init(plan: AdaptivePlan, pathClass: PathClass, knownTailnetEndpoint: Bool,
+         start: OperatingPoint?,
          now: TimeInterval = 0) {
         self.plan = plan
         self.pathClass = pathClass
+        self.knownTailnetEndpoint = knownTailnetEndpoint
         self.estimator = DeliveredRateEstimator()
+        let requestedBps = start.map { $0.targetKbps * 1000 } ?? plan.configuredBitrateBps
         if let start {
-            self.targetBps = Self.startTarget(start.targetKbps * 1000,
-                                              pathClass: pathClass, plan: plan)
+            self.targetBps = Self.startTarget(requestedBps,
+                                              knownTailnetEndpoint: knownTailnetEndpoint, plan: plan)
             self.levelIndex = max(min(max(0, start.levelIndex), plan.levels.count - 1),
                                   plan.viableIndex(targetBps: targetBps))
             self.estimator.seed(Double(targetBps) / Self.targetShareOfEstimate)
         } else {
-            self.targetBps = Self.startTarget(plan.configuredBitrateBps,
-                                              pathClass: pathClass, plan: plan)
+            self.targetBps = Self.startTarget(requestedBps,
+                                              knownTailnetEndpoint: knownTailnetEndpoint, plan: plan)
             self.levelIndex = plan.viableIndex(targetBps: targetBps)
         }
-        self.startupProbing = pathClass != .lan && targetBps < plan.configuredBitrateBps
+        self.startupProbing = knownTailnetEndpoint && requestedBps > targetBps
         self.stableSince = now
         self.cleanSince = now
     }
@@ -808,27 +812,38 @@ struct AdaptiveQualityController {
     ///
     /// Returns true when the operating point actually moved.
     @discardableResult
-    mutating func reclassify(as newClass: PathClass, remembered: OperatingPoint?) -> Bool {
+    mutating func reclassify(as newClass: PathClass, remembered: OperatingPoint?,
+                             knownTailnetEndpoint: Bool) -> Bool {
         guard newClass != pathClass else { return false }
         pathClass = newClass
+        self.knownTailnetEndpoint = knownTailnetEndpoint
         guard !hasDecided else { return false }
         let previousTarget = targetBps
         let previousLevel = levelIndex
-        if let remembered {
-            targetBps = Self.startTarget(remembered.targetKbps * 1000,
-                                        pathClass: newClass, plan: plan)
+        if let remembered, (newClass == .lan || knownTailnetEndpoint) {
+            let requestedBps = remembered.targetKbps * 1000
+            targetBps = Self.startTarget(requestedBps,
+                                        knownTailnetEndpoint: knownTailnetEndpoint, plan: plan)
             levelIndex = max(min(max(0, remembered.levelIndex), plan.levels.count - 1),
                              plan.viableIndex(targetBps: targetBps))
-        } else if newClass != .lan {
+            startupProbing = knownTailnetEndpoint && requestedBps > targetBps
+        } else if knownTailnetEndpoint {
             // A connection can first look local before its routed endpoint is
             // known. Even without a saved point, correct that optimistic start.
-            targetBps = Self.startTarget(targetBps, pathClass: newClass, plan: plan)
+            targetBps = Self.startTarget(targetBps,
+                                        knownTailnetEndpoint: true, plan: plan)
             levelIndex = max(levelIndex, plan.viableIndex(targetBps: targetBps))
+            startupProbing = startupProbing || previousTarget > targetBps
+        } else {
+            // RTT alone cannot tell a slow local Wi-Fi hop from a routed one.
+            // Do not import another path's operating point or startup cap.
+            startupProbing = false
         }
-        startupProbing = newClass != .lan && targetBps < plan.configuredBitrateBps
         guard targetBps != previousTarget || levelIndex != previousLevel else { return false }
         estimator = DeliveredRateEstimator()
-        if remembered != nil { estimator.seed(Double(targetBps) / Self.targetShareOfEstimate) }
+        if remembered != nil && (newClass == .lan || knownTailnetEndpoint) {
+            estimator.seed(Double(targetBps) / Self.targetShareOfEstimate)
+        }
         return true
     }
 
@@ -912,6 +927,7 @@ struct AdaptiveQualityController {
 
     /// The point, once it has held still long enough to be worth remembering.
     func stableOperatingPoint(at now: TimeInterval) -> OperatingPoint? {
+        guard pathClass == .lan || knownTailnetEndpoint else { return nil }
         guard let stableSince, now - stableSince >= OperatingPointStore.stableAfterSeconds
         else { return nil }
         return OperatingPoint(targetKbps: max(1, targetBps / 1000), levelIndex: levelIndex)
@@ -1039,9 +1055,9 @@ struct AdaptiveQualityController {
     /// controller asks for itself.
     mutating func resetForNewCapture(at now: TimeInterval) {
         targetBps = Self.startTarget(plan.configuredBitrateBps,
-                                    pathClass: pathClass, plan: plan)
+                                    knownTailnetEndpoint: knownTailnetEndpoint, plan: plan)
         levelIndex = plan.viableIndex(targetBps: targetBps)
-        startupProbing = pathClass != .lan && targetBps < plan.configuredBitrateBps
+        startupProbing = knownTailnetEndpoint && targetBps < plan.configuredBitrateBps
         estimator = DeliveredRateEstimator()
         baseline.reset()
         lastChangeAt = nil
@@ -1059,9 +1075,9 @@ struct AdaptiveQualityController {
         min(max(bps, plan.floorBps), plan.configuredBitrateBps)
     }
 
-    private static func startTarget(_ bps: Int, pathClass: PathClass,
+    private static func startTarget(_ bps: Int, knownTailnetEndpoint: Bool,
                                     plan: AdaptivePlan) -> Int {
-        let limit = pathClass == .lan ? plan.configuredBitrateBps : tailnetStartupBps
+        let limit = knownTailnetEndpoint ? tailnetStartupBps : plan.configuredBitrateBps
         return clamp(min(bps, limit), plan: plan)
     }
 

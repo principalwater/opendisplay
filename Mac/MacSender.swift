@@ -2156,12 +2156,15 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                                 baseWide: base.wide, baseHigh: base.high,
                                 floorBps: adaptiveFloorKbps * 1000,
                                 maxLever: adaptiveMaxLever)
-        let pathClass = provisionalPathClass()
+        let signals = pathSignals()
+        let pathClass = PathClass.classify(directLink: signals.directLink, wired: signals.wired,
+                                           tailnet: signals.tailnet, rttMs: nil)
         let remembered = OperatingPointStore.decode(
             UserDefaults.standard.object(forKey: OperatingPointStore.defaultsKey),
             for: pathClass)
         let now = ProcessInfo.processInfo.systemUptime
         let controller = AdaptiveQualityController(plan: plan, pathClass: pathClass,
+                                                   knownTailnetEndpoint: signals.tailnet,
                                                    start: remembered, now: now)
         adaptive = controller
         pathClassSettled = false
@@ -2209,16 +2212,6 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         return (false, currentPathDirectLink, wired, TailnetAddress.isTailnet(host))
     }
 
-    /// The class this session is on before any RTT has been measured: enough to
-    /// pick a remembered operating point in the first second, which is the
-    /// second that matters on LTE.
-    private func provisionalPathClass() -> PathClass {
-        let signals = pathSignals()
-        if signals.usb { return .lan }
-        return PathClass.classify(directLink: signals.directLink, wired: signals.wired,
-                                  tailnet: signals.tailnet, rttMs: nil)
-    }
-
     /// Settle the class once the receiver has measured a round trip. One
     /// correction per session: after the controller has acted on evidence, a
     /// remembered number from another class is worse information than what it
@@ -2235,7 +2228,8 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         let remembered = OperatingPointStore.decode(
             UserDefaults.standard.object(forKey: OperatingPointStore.defaultsKey),
             for: settled)
-        let moved = controller.reclassify(as: settled, remembered: remembered)
+        let moved = controller.reclassify(as: settled, remembered: remembered,
+                                          knownTailnetEndpoint: signals.tailnet)
         adaptive = controller
         Log.info(String(format: "adaptive: path settles as %@ (was %@, rtt %.0fms)",
                         settled.label, was.label, rttMs)
