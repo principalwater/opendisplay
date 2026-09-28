@@ -50,3 +50,16 @@ The external display watchdog and host-specific network configuration are
 deployment concerns and are deliberately not included in this public source
 branch. They depend on each Mac's displays, BetterDisplay identifiers, power
 policy, and network topology.
+
+## Upstream contribution context
+
+This fork draws on work proposed to upstream by other contributors: input and
+click handling in [#216](https://github.com/peetzweg/opendisplay/pull/216) and
+keyboard passthrough in [#247](https://github.com/peetzweg/opendisplay/pull/247)
+by kdbhalala, touch positioning in
+[#218](https://github.com/peetzweg/opendisplay/pull/218) by BLACKIELF, audio in
+[#274](https://github.com/peetzweg/opendisplay/pull/274) by M4st3rZeus, and
+frame-rate controls in [#276](https://github.com/peetzweg/opendisplay/pull/276)
+by KareemmSayed. These upstream proposals were still open on 2026-09-28.
+Future PRs from this fork should preserve their credit and isolate additional
+changes rather than submit the entire fork as one patch.
