@@ -75,12 +75,11 @@ final class AdaptiveQualityTests: XCTestCase {
                                           tailnet: false, rttMs: 900), .lan)
     }
 
-    func testATailnetDialWithNoMeasurementYetIsAssumedDirectNotRelayed() {
-        // Optimistic by exactly one class. The first report corrects it, and
-        // being wrong this way costs one operating point rather than starting a
-        // good link in the cellar.
+    func testATailnetDialWithNoMeasurementYetUsesTheLowRttBucket() {
+        // The first receiver report can move the session to the other
+        // latency bucket without assuming how Tailscale routed it.
         XCTAssertEqual(PathClass.classify(directLink: false, wired: false,
-                                          tailnet: true, rttMs: nil), .tailnetDirect)
+                                          tailnet: true, rttMs: nil), .tailnetLowRTT)
     }
 
     func testATailnetAddressIsNeverLanHoweverWiredItsInterfaceLooks() {
@@ -90,9 +89,9 @@ final class AdaptiveQualityTests: XCTestCase {
         // sender's long-standing "is this wired?" test says yes. Classifying
         // interface-first would hand an LTE/DERP session the LAN's 28.8 Mbps.
         XCTAssertEqual(PathClass.classify(directLink: false, wired: true,
-                                          tailnet: true, rttMs: 114), .tailnetRelay)
+                                          tailnet: true, rttMs: 114), .tailnetHighRTT)
         XCTAssertEqual(PathClass.classify(directLink: false, wired: true,
-                                          tailnet: true, rttMs: nil), .tailnetDirect)
+                                          tailnet: true, rttMs: nil), .tailnetLowRTT)
     }
 
     func testANonTailnetDialWithNoMeasurementIsLan() {
@@ -100,17 +99,17 @@ final class AdaptiveQualityTests: XCTestCase {
                                           tailnet: false, rttMs: nil), .lan)
     }
 
-    func testTheOperatorsMeasuredRoundTripClassifiesAsARelay() {
+    func testTheOperatorsMeasuredRoundTripUsesTheHighRttBucket() {
         // 114 and 156 ms are the two `rtt` values in the 15:29–15:33 window.
         XCTAssertEqual(PathClass.classify(directLink: false, wired: false,
-                                          tailnet: true, rttMs: 114), .tailnetRelay)
+                                          tailnet: true, rttMs: 114), .tailnetHighRTT)
         XCTAssertEqual(PathClass.classify(directLink: false, wired: false,
-                                          tailnet: true, rttMs: 156), .tailnetRelay)
+                                          tailnet: true, rttMs: 156), .tailnetHighRTT)
     }
 
-    func testAFastTailnetHopIsDirect() {
+    func testAFastTailnetHopUsesTheLowRttBucket() {
         XCTAssertEqual(PathClass.classify(directLink: false, wired: false,
-                                          tailnet: true, rttMs: 38), .tailnetDirect)
+                                          tailnet: true, rttMs: 38), .tailnetLowRTT)
     }
 
     func testAMillisecondRoundTripOnTheLocalWireIsLan() {
@@ -120,8 +119,10 @@ final class AdaptiveQualityTests: XCTestCase {
 
     func testTheClassesHaveStableNamesForTheLogAndForTheStore() {
         XCTAssertEqual(PathClass.lan.label, "lan")
-        XCTAssertEqual(PathClass.tailnetDirect.label, "tailnet-low-rtt")
-        XCTAssertEqual(PathClass.tailnetRelay.label, "tailnet-high-rtt")
+        XCTAssertEqual(PathClass.tailnetLowRTT.label, "tailnet-low-rtt")
+        XCTAssertEqual(PathClass.tailnetHighRTT.label, "tailnet-high-rtt")
+        XCTAssertEqual(PathClass.tailnetLowRTT.rawValue, "tailnetDirect")
+        XCTAssertEqual(PathClass.tailnetHighRTT.rawValue, "tailnetRelay")
         XCTAssertEqual(Set(PathClass.allCases.map(\.rawValue)).count, 3)
     }
 
@@ -637,20 +638,20 @@ final class AdaptiveQualityTests: XCTestCase {
     // MARK: - Remembering where a path class settled
 
     func testUnknownTailnetStartsAtFourMbpsWithAPlayableFrameRate() {
-        let controller = self.controller(pathClass: .tailnetDirect)
+        let controller = self.controller(pathClass: .tailnetLowRTT)
         XCTAssertEqual(controller.targetBps, 4_000_000)
         XCTAssertEqual(controller.level.frameRateCap, 30)
     }
 
     func testAHighRememberedTailnetRateCannotOverloadAChangedRouteAtStartup() {
-        let controller = self.controller(pathClass: .tailnetDirect,
+        let controller = self.controller(pathClass: .tailnetLowRTT,
                                          start: OperatingPoint(targetKbps: 28_800, levelIndex: 0))
         XCTAssertEqual(controller.targetBps, 4_000_000)
         XCTAssertEqual(controller.level.frameRateCap, 30)
     }
 
     func testTailnetProbesRapidlyWhileFramesAreFlowingAndTheLinkIsClean() {
-        var controller = self.controller(pathClass: .tailnetDirect)
+        var controller = self.controller(pathClass: .tailnetLowRTT)
         var targets: [Int] = []
         for step in 1...32 {
             var sample = clean()
@@ -666,7 +667,7 @@ final class AdaptiveQualityTests: XCTestCase {
     }
 
     func testTailnetDoesNotProbeWhileNoFramesAreFlowing() {
-        var controller = self.controller(pathClass: .tailnetDirect)
+        var controller = self.controller(pathClass: .tailnetLowRTT)
         let idle = LinkSample(sendQueueDepth: 0)
         XCTAssertTrue(run(&controller, idle, seconds: 20).isEmpty)
         XCTAssertEqual(controller.targetBps, 4_000_000)
@@ -674,7 +675,7 @@ final class AdaptiveQualityTests: XCTestCase {
     }
 
     func testCongestionEndsStartupProbing() {
-        var controller = self.controller(pathClass: .tailnetDirect)
+        var controller = self.controller(pathClass: .tailnetLowRTT)
         XCTAssertFalse(run(&controller, congested(), seconds: 3).isEmpty)
         let afterCongestion = controller.targetBps
         XCTAssertTrue(run(&controller, clean(), seconds: 10, from: 3).isEmpty)
@@ -682,7 +683,7 @@ final class AdaptiveQualityTests: XCTestCase {
     }
 
     func testASessionStartsFromTheRememberedOperatingPointNotAtFullRate() {
-        let controller = self.controller(pathClass: .tailnetRelay,
+        let controller = self.controller(pathClass: .tailnetHighRTT,
                                          start: OperatingPoint(targetKbps: 1400, levelIndex: 4))
         XCTAssertEqual(controller.targetBps, 1_400_000)
         XCTAssertEqual(controller.levelIndex, 4)
@@ -712,21 +713,21 @@ final class AdaptiveQualityTests: XCTestCase {
     }
 
     func testReclassifyingAdoptsTheOtherClassesPointOnlyBeforeAnythingWasDecided() {
-        var fresh = self.controller(pathClass: .tailnetDirect)
-        XCTAssertTrue(fresh.reclassify(as: .tailnetRelay,
+        var fresh = self.controller(pathClass: .tailnetLowRTT)
+        XCTAssertTrue(fresh.reclassify(as: .tailnetHighRTT,
                                        remembered: OperatingPoint(targetKbps: 1200, levelIndex: 4)))
         XCTAssertEqual(fresh.targetBps, 1_200_000)
-        XCTAssertEqual(fresh.pathClass, .tailnetRelay)
+        XCTAssertEqual(fresh.pathClass, .tailnetHighRTT)
 
-        var decided = self.controller(pathClass: .tailnetDirect)
+        var decided = self.controller(pathClass: .tailnetLowRTT)
         run(&decided, congested(bytes: 200_000), seconds: 3)
         let afterDecision = decided.targetBps
-        XCTAssertFalse(decided.reclassify(as: .tailnetRelay,
+        XCTAssertFalse(decided.reclassify(as: .tailnetHighRTT,
                                           remembered: OperatingPoint(targetKbps: 1200,
                                                                      levelIndex: 4)))
         XCTAssertEqual(decided.targetBps, afterDecision,
                        "measured evidence beats a remembered number from another class")
-        XCTAssertEqual(decided.pathClass, .tailnetRelay, "the class itself is still corrected")
+        XCTAssertEqual(decided.pathClass, .tailnetHighRTT, "the class itself is still corrected")
     }
 
     func testAFreshCaptureIsJudgedOnItsOwnEvidence() {
@@ -751,8 +752,8 @@ final class AdaptiveQualityTests: XCTestCase {
         let stored = OperatingPointStore.encode(nil,
                                                 point: OperatingPoint(targetKbps: 1400,
                                                                       levelIndex: 4),
-                                                for: .tailnetRelay)
-        XCTAssertEqual(OperatingPointStore.decode(stored, for: .tailnetRelay),
+                                                for: .tailnetHighRTT)
+        XCTAssertEqual(OperatingPointStore.decode(stored, for: .tailnetHighRTT),
                        OperatingPoint(targetKbps: 1400, levelIndex: 4))
     }
 
@@ -764,17 +765,17 @@ final class AdaptiveQualityTests: XCTestCase {
                                                 for: .lan)
         stored = OperatingPointStore.encode(stored,
                                             point: OperatingPoint(targetKbps: 1400, levelIndex: 4),
-                                            for: .tailnetRelay)
+                                            for: .tailnetHighRTT)
         XCTAssertEqual(OperatingPointStore.decode(stored, for: .lan)?.targetKbps, 28_800)
-        XCTAssertEqual(OperatingPointStore.decode(stored, for: .tailnetRelay)?.targetKbps, 1400)
-        XCTAssertNil(OperatingPointStore.decode(stored, for: .tailnetDirect))
+        XCTAssertEqual(OperatingPointStore.decode(stored, for: .tailnetHighRTT)?.targetKbps, 1400)
+        XCTAssertNil(OperatingPointStore.decode(stored, for: .tailnetLowRTT))
     }
 
     func testTheStoreIsPropertyListSafe() {
         let stored = OperatingPointStore.encode(nil,
                                                 point: OperatingPoint(targetKbps: 900,
                                                                       levelIndex: 3),
-                                                for: .tailnetDirect)
+                                                for: .tailnetLowRTT)
         XCTAssertTrue(PropertyListSerialization.propertyList(stored, isValidFor: .binary),
                       "this goes straight into UserDefaults")
     }
@@ -810,7 +811,7 @@ final class AdaptiveQualityTests: XCTestCase {
     // MARK: - Reporting
 
     func testADecisionLineCarriesTheEstimateTheTargetTheReasonAndTheLevel() {
-        var controller = self.controller(pathClass: .tailnetRelay)
+        var controller = self.controller(pathClass: .tailnetHighRTT)
         let sample = congested(bytes: 100_000)
         var change: AdaptiveQualityController.Change?
         var t = 0.0
@@ -831,7 +832,7 @@ final class AdaptiveQualityTests: XCTestCase {
     }
 
     func testThePanelLineSaysWhereTheControllerStands() {
-        let controller = self.controller(pathClass: .tailnetRelay,
+        let controller = self.controller(pathClass: .tailnetHighRTT,
                                          start: OperatingPoint(targetKbps: 1400, levelIndex: 4))
         let line = controller.panelLine(sample: clean(), at: 12)
         XCTAssertTrue(line.contains("adaptive panel:"), line)

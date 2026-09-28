@@ -77,15 +77,16 @@ import Foundation
 /// existing preferences, while log labels describe only what was measured.
 enum PathClass: String, CaseIterable, Equatable {
     case lan
-    case tailnetDirect
-    case tailnetRelay
+    // Keep the raw values so previously learned operating points still load.
+    case tailnetLowRTT = "tailnetDirect"
+    case tailnetHighRTT = "tailnetRelay"
 
     /// What the log calls it.
     var label: String {
         switch self {
         case .lan: return "lan"
-        case .tailnetDirect: return "tailnet-low-rtt"
-        case .tailnetRelay: return "tailnet-high-rtt"
+        case .tailnetLowRTT: return "tailnet-low-rtt"
+        case .tailnetHighRTT: return "tailnet-high-rtt"
         }
     }
 
@@ -94,7 +95,7 @@ enum PathClass: String, CaseIterable, Equatable {
     static let lanRttMs = 12.0
     /// Split remembered tailnet operating points by observed RTT. This is a
     /// latency bucket, not a test for the actual Tailscale route.
-    static let relayRttMs = 60.0
+    static let highRttThresholdMs = 60.0
 
     /// Classify a session.
     ///
@@ -123,13 +124,13 @@ enum PathClass: String, CaseIterable, Equatable {
         if tailnet {
             // No measurement yet: use the low-RTT memory bucket until the
             // first report. The start rate is capped for either bucket.
-            guard let rttMs, rttMs > 0 else { return .tailnetDirect }
-            return rttMs < relayRttMs ? .tailnetDirect : .tailnetRelay
+            guard let rttMs, rttMs > 0 else { return .tailnetLowRTT }
+            return rttMs < highRttThresholdMs ? .tailnetLowRTT : .tailnetHighRTT
         }
         if directLink || wired { return .lan }
         guard let rttMs, rttMs > 0 else { return .lan }
         if rttMs < lanRttMs { return .lan }
-        return rttMs < relayRttMs ? .tailnetDirect : .tailnetRelay
+        return rttMs < highRttThresholdMs ? .tailnetLowRTT : .tailnetHighRTT
     }
 }
 
