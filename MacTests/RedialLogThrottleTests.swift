@@ -66,4 +66,19 @@ final class RedialLogThrottleTests: XCTestCase {
         now += 1
         XCTAssertEqual(throttle.note("preparing", now: now), .speak)
     }
+
+    func testTwoSecondReceiverRetriesKeepTheFirstAttemptsAndOnePeriodicSummary() {
+        var throttle = RedialLogThrottle()
+        var spoken = 0
+        var summaries: [Int] = []
+        for attempt in 0...152 {
+            switch throttle.note("192.0.2.1", now: Double(attempt * 2)) {
+            case .speak: spoken += 1
+            case .quiet: break
+            case .summarise(let suppressed): summaries.append(suppressed)
+            }
+        }
+        XCTAssertEqual(spoken, 3)
+        XCTAssertEqual(summaries, [150])
+    }
 }

@@ -107,6 +107,8 @@ final class StreamReceiver: ObservableObject {
     /// Consecutive listener failures, for the backoff. Reset on `.ready`.
     private var listenerFailures = 0
     private var cursorListenerFailures = 0
+    /// Report repeated candidates by address, ignoring their changing source ports.
+    private var candidateLog = RedialLogThrottle()
     /// Rejected senders redial frequently so a host choice takes effect promptly.
     /// Keep their repeated refusals from displacing useful receiver diagnostics.
     private var refusalLog = RedialLogThrottle()
@@ -899,8 +901,25 @@ final class StreamReceiver: ObservableObject {
         created.service = advertisedService
         created.newConnectionHandler = { [weak self] conn in
             guard let self else { return }
-            Log.info("new connection from \(String(describing: conn.endpoint))")
             let peer = String(describing: conn.endpoint)
+            let peerAddress: String
+            if case .hostPort(let host, _) = conn.endpoint {
+                peerAddress = String(describing: host)
+            } else {
+                peerAddress = peer
+            }
+            let logGreeting: Bool
+            switch self.candidateLog.note(peerAddress, now: Date().timeIntervalSince1970) {
+            case .speak:
+                Log.info("new connection from \(peer)")
+                logGreeting = true
+            case .summarise(let suppressed):
+                Log.info("connection attempts from \(peerAddress) continue; "
+                         + "\(suppressed) repeats suppressed")
+                logGreeting = false
+            case .quiet:
+                logGreeting = false
+            }
             // **Nothing becomes the session until it proves it is a sender.**
             //
             // A Bonjour dial races IPv6 and IPv4 and both handshakes can
@@ -919,7 +938,8 @@ final class StreamReceiver: ObservableObject {
             // naming a `type`. With a chosen Mac, only its `welcome` passes;
             // cursor, ping, or video can precede it. Silence, a closed socket
             // and noise all fail without touching the live session.
-            self.beginProving(conn, peer: peer, hadSession: self.connection != nil)
+            self.beginProving(conn, peer: peer, hadSession: self.connection != nil,
+                              logGreeting: logGreeting)
         }
         created.stateUpdateHandler = { [weak self] state in
             guard let self else { return }
@@ -981,7 +1001,8 @@ final class StreamReceiver: ObservableObject {
     /// Runs on `queue`. The live session — if there is one — is untouched for
     /// the whole of this: `adopt` is the only thing that cancels it, and
     /// `adopt` is only reached from a verdict of `.adopt`.
-    private func beginProving(_ conn: NWConnection, peer: String, hadSession: Bool) {
+    private func beginProving(_ conn: NWConnection, peer: String, hadSession: Bool,
+                              logGreeting: Bool) {
         let proof = ProofBox()
         pendingConnections.append(conn)
 
@@ -1001,6 +1022,7 @@ final class StreamReceiver: ObservableObject {
             case .adopt(let type):
                 proof.settled = true
                 self.pendingConnections.removeAll { $0 === conn }
+                self.candidateLog.reset()
                 self.refusalLog.reset()
                 // The transport label belongs to the session, so it is set when
                 // there *is* one: a probe from a loopback forwarder used to
@@ -1082,7 +1104,7 @@ final class StreamReceiver: ObservableObject {
                 // it has read our `hello`, so waiting for bytes without sending
                 // one is a deadlock, not a test.
                 guard let self else { return }
-                self.sendHello(on: conn)
+                self.sendHello(on: conn, log: logGreeting)
                 readMore()
             case .failed(let error):
                 settle(.reject(reason: "the connection failed before it said anything (\(error))"))
@@ -1385,7 +1407,8 @@ final class StreamReceiver: ObservableObject {
 
     // MARK: - Control messages (phone -> Mac)
 
-    private func sendHello(on conn: NWConnection, includeCursorPort: Bool = true) {
+    private func sendHello(on conn: NWConnection, includeCursorPort: Bool = true,
+                           log: Bool = true) {
         var hello: [String: Any] = [
             "type": "hello",
             "pixelsWide": devicePixelsWide,
@@ -1442,9 +1465,11 @@ final class StreamReceiver: ObservableObject {
         // read this number — and its "not sent" line and this one are the two
         // ends of the same fact. If one appears without the other, the `hello`
         // never arrived.
-        Log.info("hello sent\(cursorListenerReady ? " (cursorPort \(cursorPort))" : "")"
-                 + " — pv \(WireProtocol.version), ready for audio frames"
-                 + "\(audioMuted ? " (muted locally; the Mac still sends them)" : "")")
+        if log {
+            Log.info("hello sent\(cursorListenerReady ? " (cursorPort \(cursorPort))" : "")"
+                     + " — pv \(WireProtocol.version), ready for audio frames"
+                     + "\(audioMuted ? " (muted locally; the Mac still sends them)" : "")")
+        }
         // `modSidebar` is connection-scoped state and the sender clears it on
         // every ready connection, so it has to be re-asserted here — `hello` is
         // the one message that is sent on every new or adopted link.

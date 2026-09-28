@@ -782,16 +782,13 @@ struct AdaptiveQualityController {
         self.knownTailnetEndpoint = knownTailnetEndpoint
         self.estimator = DeliveredRateEstimator()
         let requestedBps = start.map { $0.targetKbps * 1000 } ?? plan.configuredBitrateBps
+        self.targetBps = Self.startTarget(requestedBps,
+                                          knownTailnetEndpoint: knownTailnetEndpoint, plan: plan)
+        self.levelIndex = plan.viableIndex(targetBps: targetBps)
         if let start {
-            self.targetBps = Self.startTarget(requestedBps,
-                                              knownTailnetEndpoint: knownTailnetEndpoint, plan: plan)
             self.levelIndex = max(min(max(0, start.levelIndex), plan.levels.count - 1),
-                                  plan.viableIndex(targetBps: targetBps))
+                                  levelIndex)
             self.estimator.seed(Double(targetBps) / Self.targetShareOfEstimate)
-        } else {
-            self.targetBps = Self.startTarget(requestedBps,
-                                              knownTailnetEndpoint: knownTailnetEndpoint, plan: plan)
-            self.levelIndex = plan.viableIndex(targetBps: targetBps)
         }
         self.startupProbing = knownTailnetEndpoint && requestedBps > targetBps
         self.stableSince = now
@@ -818,9 +815,10 @@ struct AdaptiveQualityController {
         pathClass = newClass
         self.knownTailnetEndpoint = knownTailnetEndpoint
         guard !hasDecided else { return false }
+        let remembered = newClass == .lan || knownTailnetEndpoint ? remembered : nil
         let previousTarget = targetBps
         let previousLevel = levelIndex
-        if let remembered, (newClass == .lan || knownTailnetEndpoint) {
+        if let remembered {
             let requestedBps = remembered.targetKbps * 1000
             targetBps = Self.startTarget(requestedBps,
                                         knownTailnetEndpoint: knownTailnetEndpoint, plan: plan)
@@ -841,7 +839,7 @@ struct AdaptiveQualityController {
         }
         guard targetBps != previousTarget || levelIndex != previousLevel else { return false }
         estimator = DeliveredRateEstimator()
-        if remembered != nil && (newClass == .lan || knownTailnetEndpoint) {
+        if remembered != nil {
             estimator.seed(Double(targetBps) / Self.targetShareOfEstimate)
         }
         return true
