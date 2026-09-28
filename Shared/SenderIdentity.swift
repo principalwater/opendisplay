@@ -58,16 +58,13 @@ enum SenderChoice {
     /// had: whoever dials first gets the screen.
     static let anyMac = ""
 
-    /// How long a refused sender is asked to wait. Long enough that it is not
-    /// re-dialing every few seconds while the user works on the other Mac,
-    /// short enough that unplugging the chosen one and picking this one is not
-    /// a coffee break.
-    static let defaultRetryAfterMs = 30_000
+    /// A refused sender checks again soon enough to follow a receiver-side
+    /// choice change. Rejection happens before display and encoder setup, so
+    /// this inexpensive dial also works when Bonjour cannot cross a tailnet.
+    static let defaultRetryAfterMs = 2_000
 
-    /// The backoff used by "Switch to…": the sender being dropped is being
-    /// dropped *for* another one that is about to be accepted, and if that
-    /// other Mac turns out not to be there, five seconds is how long the user
-    /// waits to get the first one back.
+    /// Give the previously connected sender time to yield to the new choice.
+    /// It remains refused while the preference names another Mac.
     static let switchRetryAfterMs = 5_000
 
     /// Whether a sender that has just identified itself should be refused.

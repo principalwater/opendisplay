@@ -102,14 +102,15 @@ final class SenderChoiceTests: XCTestCase {
 
     // MARK: - The `rejected` message
 
-    func testTheDefaultBackoffIsThirtySeconds() {
-        XCTAssertEqual(SenderChoice.defaultRetryAfterMs, 30_000)
+    func testAPreviouslyRefusedMacRechecksSoonAfterAChoiceChange() {
+        XCTAssertLessThanOrEqual(SenderChoice.defaultRetryAfterMs, 3_000)
+        XCTAssertGreaterThanOrEqual(SenderChoice.defaultRetryAfterMs,
+                                    RejectionMessage.minRetryAfterMs)
     }
 
-    func testSwitchingUsesAMuchShorterBackoff() {
-        // "Switch to…" is a swap, not a ban: if the Mac just chosen is not
-        // actually running, the one being left comes back in seconds.
-        XCTAssertLessThan(SenderChoice.switchRetryAfterMs, SenderChoice.defaultRetryAfterMs)
+    func testThePreviousMacYieldsWhileTheNewOneRetries() {
+        XCTAssertGreaterThan(SenderChoice.switchRetryAfterMs,
+                             SenderChoice.defaultRetryAfterMs)
     }
 
     func testAPeerSuppliedBackoffIsClamped() {
