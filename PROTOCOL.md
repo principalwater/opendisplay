@@ -365,6 +365,7 @@ Coordinates use the conventions of section 7.
 | `scroll` | pv 1 | `dx`, `dy`, `phase`? | Two-finger / trackpad / wheel scroll; `phase` is additive at pv 3 |
 | `pointer` | pv 3 | `phase`, `x`, `y`, `t`? | Indirect-pointer hover: move the cursor, press nothing |
 | `key` | pv 3 | `code`, `down`, `mod`, `char`? | Hardware keyboard key transition |
+| `modifierSnapshot` | pv 4 (additive) | `mod` | Physical modifier state before a touch; repairs a lost key release |
 | `modSidebar` | pv 3 | `flags` | Latched modifiers from an on-screen modifier sidebar |
 | `zoom` | pv 3 | `scale`, `phase`, `x`?, `y`? | Pinch-to-zoom, as an incremental magnification factor; `x`/`y` are the pinch centroid, additive at pv 4 |
 | `pencil` | pv 3 | `phase`, `x`, `y`, `pressure`, `azimuth`, `altitude`, `rotation`, `t`? | Stylus input |
@@ -656,6 +657,13 @@ hardware keyboard attached to the receiver:
   produced. Senders SHOULD use it **only** for usages they have no keycode
   for (media keys and the like); using it for mapped keys overrides the
   sender's input source and breaks non-Latin layouts and dead keys.
+
+**`modifierSnapshot`** carries the current physical `UIKeyModifierFlags`
+bitmask before a new touch. A sender SHOULD release tracked modifiers whose
+category is absent from this snapshot; it MUST preserve a modifier still
+reported as held, so modified clicks keep working. This repairs a key-up
+consumed by the receiver OS without guessing from an idle timeout. Receivers
+without this message and senders that ignore it keep their prior behavior.
 
 Auto-repeat is **not** on the wire. iOS delivers no repeat events for a
 held key, so a receiver has nothing to forward; senders that want repeat
@@ -1007,7 +1015,8 @@ one immediately — which is how a refusal becomes a connect/refuse loop.
 
 * `retryAfterMs` (number, optional): how long the sender is asked to wait
   before dialing this receiver again. Absent means the sender chooses;
-  the official sender treats absent as 30 000.
+  the official sender treats absent as 2 000, so a sender previously refused
+  can follow a changed receiver preference without an app restart.
 * `reason` (string, optional): why, for logs and UI. Defined values:
   `"otherMacSelected"`. Unknown values MUST be treated as unspecified, not
   as an error.
@@ -1030,9 +1039,8 @@ Normative requirements:
 * A receiver MUST keep listening after a `rejected`: the entire purpose is
   to be available for a different sender a moment later.
 * A receiver MAY send `rejected` to a sender it had already accepted —
-  that is how "switch to the other Mac" works from the receiver's UI. A
-  short `retryAfterMs` is appropriate there, so the sender being displaced
-  comes back quickly if the newly chosen one turns out not to be running.
+  that is how "switch to the other Mac" works from the receiver's UI. The
+  displaced sender remains refused while another sender is selected.
 
 ## 7. Coordinate spaces and units
 
@@ -1185,6 +1193,7 @@ Mechanics at a glance (the policy behind them lives in COMPATIBILITY.md):
 | 3 (additive) | `scroll.phase`, `zoom` (6.1); optional, no bump |
 | 4 | Typed frame header (4.1) replacing the section 4 demux heuristic; audio packets (4.2). Phase one: peers below 4 keep the heuristic |
 | 4 (additive) | `welcome.host`, `welcome.senderID`, and `rejected` (6.2, 6.6); optional, no bump |
+| 4 (additive) | `modifierSnapshot` (6.1); optional, no bump |
 | 4 (additive) | `hello.audioSeq` and the audio packet's `sequence` field (4.2, 6.1); negotiated, optional, no bump |
 | 4 (additive) | `zoom.x`/`zoom.y`, the pinch centroid (6.1); optional, no bump |
 | 4 (additive) | `welcome.statsUdp`, `stats.sq`, and `stats` on the UDP cursor flow (6.1, 6.2, 6.3); negotiated, optional, no bump |
@@ -1331,6 +1340,13 @@ recorded as hints for porters:
      eviction (section 5.3) — but throttle it, because an IDR is a bitrate
      spike and one per evicted frame deepens the queue it is recovering
      from.
+  5. **Start an unmeasured routed path conservatively, then probe.** A fast
+     Tailscale RTT does not prove a direct route: a nearby relay may also
+     answer in a few milliseconds. The sender caps the initial tailnet target
+     at 4 Mbps, including a remembered higher rate, then doubles it after
+     clean receiver reports with delivered frames. Without a report it waits
+     for the normal recovery interval. Congestion ends this startup probe;
+     normal recovery resumes after sustained health.
 
 ## Appendix C: Document history
 

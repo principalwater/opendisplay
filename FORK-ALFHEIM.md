@@ -1,7 +1,7 @@
 # OpenDisplay Alfheim fork
 
 This branch contains the source used by a Mac sender and an iPad receiver in a
-personal remote-desktop setup. It is based on upstream OpenDisplay v1.21.0 and
+personal remote-desktop setup. It is based on upstream OpenDisplay v1.22.0 and
 keeps the upstream GPL-3.0 license and attribution. Signed macOS packages are
 published separately in GitHub Releases. Local machine names, network details,
 and development logs are not included in this branch's history.
@@ -10,10 +10,14 @@ and development logs are not included in this branch's history.
 
 - Hardware keyboard passthrough, key repeat, a selectable Command-key stand-in,
   pointer hover, secondary click, scrolling, and native touch gestures.
+- A left Option/Command swap and a Control+backtick Escape binding are available
+  in the Mac keyboard settings. Together they preserve Command+Option shortcuts
+  and Command+backtick window switching when iPadOS delivers the key presses.
 - System audio streaming with optional host-speaker silencing tied to the
   actual audio delivery gate.
 - Remote, Extend, and Mirror layouts; 120 Hz default where the receiver and
-  path support it; adaptive quality and congestion handling.
+  path support it; adaptive quality and congestion handling. Routed sessions
+  start conservatively and probe upward when frames flow without congestion.
 - Sender and receiver admission, reconnection, and cable/LAN deduplication.
   The receiver checks the chosen Mac before replacing a live session, and the
   sender waits for its admission before creating a virtual display. Its idle
