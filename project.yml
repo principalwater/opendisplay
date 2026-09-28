@@ -181,7 +181,6 @@ targets:
       - Mac/LogPolicies.swift
       - Shared/Protocol.swift
       - Shared/LogSnapshot.swift
-      - Shared/Protocol.swift
       - Shared/FrameCodec.swift
       - Shared/AudioPacket.swift
       - Shared/AudioJitterBuffer.swift
@@ -206,6 +205,7 @@ targets:
       - Shared/SenderIdentity.swift
       # Pure, UIKit-free: the Native-mode gesture decisions (iOS), tested here.
       - iOS/NativeTouchPolicy.swift
+      - MacReceiver/FullscreenPreference.swift
     settings:
       base:
         # A hostless test bundle: the sources under test are compiled straight
