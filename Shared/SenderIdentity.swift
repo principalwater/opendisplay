@@ -15,8 +15,8 @@ import Foundation
 /// A sender, as the receiver sees it.
 struct SenderIdentity: Equatable, Identifiable, Hashable {
     /// A UUID the sender persists in its own defaults. Stable across restarts,
-    /// renames and network changes — which is the point: the user picks "the
-    /// Studio", not "whatever is at 100.64.0.3 today".
+    /// renames and network changes — which is the point: the user picks a
+    /// familiar Mac, not whichever address it happens to have today.
     let id: String
     /// The Mac's computer name, for the user to recognise it by. May change;
     /// the id may not.

@@ -3,8 +3,8 @@
 This branch contains the source used by a Mac sender and an iPad receiver in a
 personal remote-desktop setup. It is based on upstream OpenDisplay v1.22.0 and
 keeps the upstream GPL-3.0 license and attribution. Signed macOS packages are
-published separately in GitHub Releases. Local machine names, network details,
-and development logs are not included in this branch's history.
+published separately in GitHub Releases. Host-specific configuration,
+credentials, and development logs are not included in this branch.
 
 ## Added behavior
 
