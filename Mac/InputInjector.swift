@@ -495,8 +495,9 @@ final class InputInjector {
                 modifiers.update(hidUsage: usage, down: false)
                 guard let key = KeyboardMap.macKeyCode(for: usage,
                                                        commandKeyRemap: commandKeyRemap) else { continue }
-                let flags = modifiers.flags(reported: 0, includeReported: false,
+                var flags = modifiers.flags(reported: rawModifiers, includeReported: false,
                                             commandKeyRemap: commandKeyRemap)
+                if keyRemapPlan.claimsCapsLock { flags.subtract(.maskAlphaShift) }
                 post(virtualKey: key, down: false, flags: flags,
                      isModifier: true, autorepeat: false)
             }
@@ -560,6 +561,9 @@ final class InputInjector {
         if hidUsage == KeyboardMap.HID.grave,
            keyRemapPlan.graveRule == .commandChordIsEscape
             || keyRemapPlan.graveRule == .controlChordIsEscape {
+            // A lost chord key-up must not swallow the release of a later
+            // plain backtick press.
+            if down { graveChordConsumed = false }
             if !down, graveChordConsumed {
                 graveChordConsumed = false
                 return

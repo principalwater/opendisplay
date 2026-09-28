@@ -141,6 +141,18 @@ final class KeyboardInjectionTests: XCTestCase {
         XCTAssertTrue(sink.events.first?.flags.contains(.maskCommand) ?? false)
     }
 
+    func testTouchSnapshotKeepsReportedCapsLockWhenReleasingLostModifier() {
+        let injector = makeInjector(remap: .leftOption)
+        injector.handleKey(hidUsage: KeyboardMap.HID.leftOption, down: true)
+        sink.reset()
+
+        injector.reconcileModifiers(reported: KeyboardMap.uiAlphaShift)
+
+        XCTAssertEqual(sink.events.map(\.type), [.flagsChanged])
+        XCTAssertTrue(sink.events.first?.flags.contains(.maskAlphaShift) ?? false)
+        XCTAssertFalse(sink.events.first?.flags.contains(.maskCommand) ?? true)
+    }
+
     func testSwappedLeftModifiersProduceCommandOptionArrow() {
         let injector = makeInjector(remap: .swapLeftOptionCommand)
         injector.handleKey(hidUsage: KeyboardMap.HID.leftOption, down: true,
@@ -177,6 +189,21 @@ final class KeyboardInjectionTests: XCTestCase {
                            rawModifiers: KeyboardMap.uiControl)
         XCTAssertEqual(sink.events.map(\.keyCode), [0x35, 0x35])
         XCTAssertTrue(sink.events.allSatisfy { !$0.flags.contains(.maskControl) })
+    }
+
+    func testLostEscapeChordReleaseCannotSwallowANewBacktickRelease() {
+        let injector = makeInjector(remap: .leftOption, escapeKey: .leftCommandGrave)
+        injector.handleKey(hidUsage: KeyboardMap.HID.leftOption, down: true)
+        injector.handleKey(hidUsage: KeyboardMap.HID.grave, down: true,
+                           rawModifiers: KeyboardMap.uiAlternate)
+        injector.handleKey(hidUsage: KeyboardMap.HID.leftOption, down: false)
+        sink.reset()
+
+        injector.handleKey(hidUsage: KeyboardMap.HID.grave, down: true)
+        injector.handleKey(hidUsage: KeyboardMap.HID.grave, down: false)
+
+        XCTAssertEqual(sink.events.map(\.type), [.keyDown, .keyUp])
+        XCTAssertEqual(sink.events.map(\.keyCode), [0x32, 0x32])
     }
 
     func testCapsLockIsCarriedAsAFlagAndNotInjectedAsAKey() {

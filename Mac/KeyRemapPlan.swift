@@ -125,7 +125,7 @@ enum EscapeKeySource: String, CaseIterable, Sendable {
         case .leftCommandGrave:
             return "Command+` sends Escape and never reaches this Mac as ⌘` (no window cycling). A plain ` still types a backtick and Shift+` a tilde. iPadOS may reserve ⌘` for itself — if the chord does nothing, press the Option key that \"Command key\" above turns into Command instead; iPadOS reserves neither Option key. Applies to the next session."
         case .controlGrave:
-            return "Control+` sends Escape. Command+` remains available for switching Mac windows; plain ` and Shift+` keep their characters. Applies to the next session."
+            return "Control+` sends Escape and does not reach this Mac as Control+`. Command+` remains available for switching Mac windows; plain ` and Shift+` keep their characters. Applies to the next session."
         }
     }
 
