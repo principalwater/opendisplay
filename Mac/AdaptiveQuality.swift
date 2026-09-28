@@ -71,11 +71,10 @@ import Foundation
 /// Which kind of path this session runs over, as far as a congestion
 /// controller needs to care.
 ///
-/// Three classes, because the three behave differently enough that an
-/// operating point learned on one is worthless on another: a LAN carries the
-/// configured 28.8 Mbps, a direct tailnet hop carries a few Mbps with a
-/// tolerable RTT, and a **relayed** tailnet hop (DERP) carries one or two and
-/// punishes every extra byte with head-of-line blocking.
+/// The tailnet classes are RTT buckets for operating-point memory. RTT alone
+/// cannot identify a direct versus DERP route: a nearby DERP may be faster
+/// than a long-distance direct hop. The stored case names remain stable for
+/// existing preferences, while log labels describe only what was measured.
 enum PathClass: String, CaseIterable, Equatable {
     case lan
     case tailnetDirect
@@ -85,17 +84,16 @@ enum PathClass: String, CaseIterable, Equatable {
     var label: String {
         switch self {
         case .lan: return "lan"
-        case .tailnetDirect: return "tailnet-direct"
-        case .tailnetRelay: return "tailnet-relay"
+        case .tailnetDirect: return "tailnet-low-rtt"
+        case .tailnetRelay: return "tailnet-high-rtt"
         }
     }
 
     /// Round trips at or below this are a local network. A LAN hop is 1–8 ms;
     /// the operator's relayed session measured 60–156 ms.
     static let lanRttMs = 12.0
-    /// Above this a tailnet hop is being relayed rather than carried directly.
-    /// A direct UDP hop over LTE lands in the 30–50 ms range; DERP adds a
-    /// second leg through a relay and lands well past it.
+    /// Split remembered tailnet operating points by observed RTT. This is a
+    /// latency bucket, not a test for the actual Tailscale route.
     static let relayRttMs = 60.0
 
     /// Classify a session.
@@ -123,8 +121,8 @@ enum PathClass: String, CaseIterable, Equatable {
     static func classify(directLink: Bool, wired: Bool,
                          tailnet: Bool, rttMs: Double?) -> PathClass {
         if tailnet {
-            // No measurement yet: assume direct rather than relayed —
-            // optimistic by exactly one class, which the first report corrects.
+            // No measurement yet: use the low-RTT memory bucket until the
+            // first report. The start rate is capped for either bucket.
             guard let rttMs, rttMs > 0 else { return .tailnetDirect }
             return rttMs < relayRttMs ? .tailnetDirect : .tailnetRelay
         }
@@ -744,6 +742,11 @@ struct AdaptiveQualityController {
     /// a second of a stalled stream is already visible — but not zero, so a
     /// single burst (a window opening, a keyframe) costs nothing.
     static let congestionHoldSeconds = 1.0
+    /// An unknown routed path should become interactive before it is asked to
+    /// carry the configured desktop bitrate. A fast path probes back up.
+    static let tailnetStartupBps = 4_000_000
+    static let startupProbeSeconds = cooldownSeconds
+    static let startupProbeFactor = 2.0
 
     // ── State ──────────────────────────────────────────────────────────────
 
@@ -764,6 +767,7 @@ struct AdaptiveQualityController {
     private var penaltyUntil: TimeInterval?
     private var stableSince: TimeInterval?
     private var lastSignal: CongestionSignal?
+    private var startupProbing = false
 
     var level: QualityLevel { plan.levels[min(levelIndex, plan.levels.count - 1)] }
     var estimateBps: Int { Int(estimator.estimateBps.rounded()) }
@@ -774,13 +778,17 @@ struct AdaptiveQualityController {
         self.pathClass = pathClass
         self.estimator = DeliveredRateEstimator()
         if let start {
-            self.targetBps = Self.clamp(start.targetKbps * 1000, plan: plan)
-            self.levelIndex = min(max(0, start.levelIndex), plan.levels.count - 1)
-            self.estimator.seed(Double(start.targetKbps) * 1000 / Self.targetShareOfEstimate)
+            self.targetBps = Self.startTarget(start.targetKbps * 1000,
+                                              pathClass: pathClass, plan: plan)
+            self.levelIndex = max(min(max(0, start.levelIndex), plan.levels.count - 1),
+                                  plan.viableIndex(targetBps: targetBps))
+            self.estimator.seed(Double(targetBps) / Self.targetShareOfEstimate)
         } else {
-            self.targetBps = plan.configuredBitrateBps
-            self.levelIndex = 0
+            self.targetBps = Self.startTarget(plan.configuredBitrateBps,
+                                              pathClass: pathClass, plan: plan)
+            self.levelIndex = plan.viableIndex(targetBps: targetBps)
         }
+        self.startupProbing = pathClass != .lan && targetBps < plan.configuredBitrateBps
         self.stableSince = now
         self.cleanSince = now
     }
@@ -803,10 +811,13 @@ struct AdaptiveQualityController {
         guard newClass != pathClass else { return false }
         pathClass = newClass
         guard !hasDecided, let remembered else { return false }
-        targetBps = Self.clamp(remembered.targetKbps * 1000, plan: plan)
-        levelIndex = min(max(0, remembered.levelIndex), plan.levels.count - 1)
+        targetBps = Self.startTarget(remembered.targetKbps * 1000,
+                                    pathClass: newClass, plan: plan)
+        levelIndex = max(min(max(0, remembered.levelIndex), plan.levels.count - 1),
+                         plan.viableIndex(targetBps: targetBps))
         estimator = DeliveredRateEstimator()
-        estimator.seed(Double(remembered.targetKbps) * 1000 / Self.targetShareOfEstimate)
+        estimator.seed(Double(targetBps) / Self.targetShareOfEstimate)
+        startupProbing = newClass != .lan && targetBps < plan.configuredBitrateBps
         return true
     }
 
@@ -853,9 +864,18 @@ struct AdaptiveQualityController {
             return decrease(on: signal, at: now)
         case .clean:
             congestedSince = nil
+            if startupProbing && (sample.framesEncoded == 0 || sample.bytesDelivered == 0) {
+                cleanSince = nil
+                return nil
+            }
             let since = cleanSince ?? now
             cleanSince = since
-            guard now - since >= Self.increaseAfterCleanSeconds else { return nil }
+            // A local socket can accept bytes faster than a remote relay
+            // delivers them. Wait for the receiver's first clean report before
+            // probing early; without reports, use the normal 15-second hold.
+            let cleanHold = startupProbing && sample.receiverIsFresh
+                ? Self.startupProbeSeconds : Self.increaseAfterCleanSeconds
+            guard now - since >= cleanHold else { return nil }
             guard canChange(at: now) else { return nil }
             return increase(at: now)
         case .neither:
@@ -937,6 +957,7 @@ struct AdaptiveQualityController {
 
         targetBps = next
         levelIndex = nextLevel
+        startupProbing = false
         lastChangeAt = now
         congestedSince = now      // the next decrease needs its own hold
         stableSince = nil
@@ -967,7 +988,8 @@ struct AdaptiveQualityController {
         }
         ceiling = max(ceiling, plan.floorBps)
 
-        var next = Self.clamp(min(Int((Double(previousTarget) * Self.increaseFactor).rounded()),
+        let increaseFactor = startupProbing ? Self.startupProbeFactor : Self.increaseFactor
+        var next = Self.clamp(min(Int((Double(previousTarget) * increaseFactor).rounded()),
                                   ceiling), plan: plan)
         if next < previousTarget { next = previousTarget }
 
@@ -984,6 +1006,7 @@ struct AdaptiveQualityController {
 
         targetBps = next
         levelIndex = nextLevel
+        if targetBps == plan.configuredBitrateBps { startupProbing = false }
         lastChangeAt = now
         cleanSince = now          // one change per clean window
         stableSince = nil
@@ -1004,8 +1027,10 @@ struct AdaptiveQualityController {
     /// a transport migration) — but **not** for the capture rebuild this
     /// controller asks for itself.
     mutating func resetForNewCapture(at now: TimeInterval) {
-        targetBps = plan.configuredBitrateBps
-        levelIndex = 0
+        targetBps = Self.startTarget(plan.configuredBitrateBps,
+                                    pathClass: pathClass, plan: plan)
+        levelIndex = plan.viableIndex(targetBps: targetBps)
+        startupProbing = pathClass != .lan && targetBps < plan.configuredBitrateBps
         estimator = DeliveredRateEstimator()
         baseline.reset()
         lastChangeAt = nil
@@ -1023,6 +1048,12 @@ struct AdaptiveQualityController {
         min(max(bps, plan.floorBps), plan.configuredBitrateBps)
     }
 
+    private static func startTarget(_ bps: Int, pathClass: PathClass,
+                                    plan: AdaptivePlan) -> Int {
+        let limit = pathClass == .lan ? plan.configuredBitrateBps : tailnetStartupBps
+        return clamp(min(bps, limit), plan: plan)
+    }
+
     static func mbps(_ bps: Int) -> String {
         String(format: "%.2f", Double(bps) / 1_000_000)
     }
@@ -1037,7 +1068,9 @@ struct AdaptiveQualityController {
         case .congestion(let signal):
             what = "decrease ×\(String(format: "%.2f", Self.decreaseFactor)) on \(signal.label)"
         case .sustainedHealth:
-            what = "increase +\(Int((Self.increaseFactor - 1) * 100))% on sustained health"
+            let factor = change.previousTargetBps > 0
+                ? Double(change.targetBps) / Double(change.previousTargetBps) : 1
+            what = "increase +\(Int(((factor - 1) * 100).rounded()))% on sustained health"
         case .leverOnly:
             what = change.isDecrease
                 ? "lever down on \(lastSignal?.label ?? "congestion")"

@@ -2161,9 +2161,8 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             UserDefaults.standard.object(forKey: OperatingPointStore.defaultsKey),
             for: pathClass)
         let now = ProcessInfo.processInfo.systemUptime
-        var controller = AdaptiveQualityController(plan: plan, pathClass: pathClass,
+        let controller = AdaptiveQualityController(plan: plan, pathClass: pathClass,
                                                    start: remembered, now: now)
-        controller.noteApplied(at: now)
         adaptive = controller
         pathClassSettled = false
         if activeScale != quality {
@@ -2176,8 +2175,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         }.joined(separator: " → ")
         Log.info("adaptive: path \(pathClass.label)"
                  + (remembered == nil
-                    ? " (nothing remembered — starting at the configured "
-                      + "\(AdaptiveQualityController.mbps(plan.configuredBitrateBps)) Mbps)"
+                    ? " (nothing remembered — using a path-safe start)"
                     : " — resuming the remembered operating point")
                  + ", start \(controller.startDescription), "
                  + "floor \(adaptiveFloorKbps)kbps, ceiling "
