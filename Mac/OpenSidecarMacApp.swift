@@ -1052,6 +1052,7 @@ final class SenderController: ObservableObject {
             guard let self, let session else { return }
             Log.info("device disconnected — session \(session.id) stopped")
             self.end(session)
+            self.exitAfterReceiverLossIfConfigured()
         }
         sender.onPeerSleeping = { [weak self, weak session] in
             // The device locked. Unlike a plain disconnect this is a
@@ -1063,6 +1064,7 @@ final class SenderController: ObservableObject {
             let target = session.target
             Log.info("session \(session.id) asleep — display down, waiting for wake")
             self.end(session)
+            if self.exitAfterReceiverLossIfConfigured() { return }
             self.connect(to: target, awaitingWake: true)
         }
         sender.onCaptureStoppedByUser = { [weak self, weak session] in
@@ -1118,6 +1120,7 @@ final class SenderController: ObservableObject {
             guard let self, let session else { return }
             Log.info("session \(session.id) closed by the receiver — ending")
             self.end(session)
+            self.exitAfterReceiverLossIfConfigured()
         }
         sessions.append(session)
         // A dialer row is not a live stream. Host silence begins only after
@@ -1178,6 +1181,19 @@ final class SenderController: ObservableObject {
         session.sender.stop()
         sessions.removeAll { $0.id == session.id }
         updateSpeakerMute()   // the last session leaving un-mutes the speakers
+    }
+
+    // A supervised headless Mac may need its physical display restored before
+    // accepting another receiver. Opt in on that Mac only; the supervisor
+    // relaunches this app after the display is ready.
+    @discardableResult
+    private func exitAfterReceiverLossIfConfigured() -> Bool {
+        guard sessions.isEmpty, UserDefaults.standard.bool(forKey: "exitAfterReceiverLoss") else {
+            return false
+        }
+        Log.info("exitAfterReceiverLoss — quitting after session teardown")
+        NSApp.terminate(nil)
+        return true
     }
 
     /// Layout/quality apply per-pipeline at construction — rebuild every session.
