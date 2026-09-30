@@ -107,7 +107,7 @@ enum CommandKeyRemap: String, CaseIterable, Sendable {
         case .bothOptions:
             return "Both Option keys on the device's keyboard arrive as Command; no Option key is left. Applies to the next session."
         case .swapLeftOptionCommand:
-            return "Left Option arrives as Command and left Command as Option, so both modifiers remain available together. Applies to the next session."
+            return "Left Option arrives as Command and left Command as Option. Left Option+Shift+Left/Right Arrow sends Command+Option+Arrow for tab switching. Applies to the next session."
         }
     }
 

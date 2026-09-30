@@ -253,7 +253,7 @@ final class KeyboardInjectionTests: XCTestCase {
 
     func testRemappedShiftArrowsKeepNativeNavigationFlags() {
         // UIKit may omit the arrow's key-class flags. Overwriting CGEvent's
-        // native flags must not turn a Command+Shift arrow into a plain key.
+        // native flags must not turn a remapped arrow shortcut into a plain key.
         let injector = makeInjector(remap: .swapLeftOptionCommand)
         let raw = KeyboardMap.uiAlternate | KeyboardMap.uiShift
         injector.handleKey(hidUsage: KeyboardMap.HID.leftOption, down: true,
@@ -273,8 +273,8 @@ final class KeyboardInjectionTests: XCTestCase {
                 XCTAssertEqual(event.flags.intersection(keyClass),
                                native.flags.intersection(keyClass))
                 XCTAssertTrue(event.flags.contains(.maskCommand))
-                XCTAssertTrue(event.flags.contains(.maskShift))
-                XCTAssertFalse(event.flags.contains(.maskAlternate))
+                XCTAssertEqual(event.flags.contains(.maskShift), usage == 0x51 || usage == 0x52)
+                XCTAssertEqual(event.flags.contains(.maskAlternate), usage == 0x4F || usage == 0x50)
             }
         }
 
@@ -285,9 +285,114 @@ final class KeyboardInjectionTests: XCTestCase {
                       "letters must not inherit navigation flags")
     }
 
+    func testLeftOptionShiftTabArrowsRepeatAndReleaseWithoutChangingModifierState() {
+        // The requested tab chord must reach macOS as Command+Option, while
+        // Shift remains physical state for other keys, pointers and releases.
+        let commandOption = KeyboardMap.flags(forModifier: KeyboardMap.HID.leftCommand,
+                                              commandKeyRemap: .none)
+            .union(KeyboardMap.flags(forModifier: KeyboardMap.HID.leftOption,
+                                     commandKeyRemap: .none))
+        let heldFlags = CGEventFlags.maskCommand.union(.maskAlternate).union(.maskShift)
+        let shiftBits = KeyboardMap.flags(forModifier: KeyboardMap.HID.leftShift,
+                                          commandKeyRemap: .none)
+            .union(KeyboardMap.flags(forModifier: KeyboardMap.HID.rightShift,
+                                     commandKeyRemap: .none))
+        let raw = KeyboardMap.uiAlternate | KeyboardMap.uiShift
+        for shift in [KeyboardMap.HID.leftShift, KeyboardMap.HID.rightShift] {
+            for arrow: UInt16 in [0x4F, 0x50] {
+                let injector = makeInjector(remap: .swapLeftOptionCommand)
+                injector.handleKey(hidUsage: KeyboardMap.HID.leftOption, down: true)
+                injector.handleKey(hidUsage: shift, down: true)
+                sink.reset()
+                injector.handleKey(hidUsage: arrow, down: true, rawModifiers: raw)
+                scheduler.tick()
+                injector.handleKey(hidUsage: arrow, down: false, rawModifiers: raw)
+                XCTAssertEqual(sink.events.map(\.type), [.keyDown, .keyDown, .keyUp])
+                for event in sink.events {
+                    XCTAssertEqual(event.flags, commandOption.union([.maskNumericPad, .maskSecondaryFn]))
+                    XCTAssertTrue(event.flags.intersection(shiftBits).isEmpty)
+                }
+                // Releasing modifiers before the arrow cannot reassert them
+                // from UIKit's stale key-up snapshot or a queued repeat.
+                injector.handleKey(hidUsage: arrow, down: true, rawModifiers: raw)
+                injector.handleKey(hidUsage: KeyboardMap.HID.leftOption, down: false)
+                injector.handleKey(hidUsage: shift, down: false)
+                sink.reset()
+                scheduler.tick()
+                injector.handleKey(hidUsage: arrow, down: false, rawModifiers: raw)
+                scheduler.tickAfterCancel()
+                XCTAssertEqual(sink.events.map(\.type), [.keyDown, .keyUp])
+                XCTAssertTrue(sink.events.allSatisfy { $0.flags.intersection(heldFlags).isEmpty })
+                sink.reset()
+                injector.handleTouch(phase: "began", x: 0.5, y: 0.5)
+                XCTAssertTrue(sink.events.allSatisfy { $0.flags.intersection(heldFlags).isEmpty })
+            }
+        }
+    }
+
+    func testTabArrowAliasPreservesOtherChordsAndClearsOnReset() {
+        for remap in CommandKeyRemap.allCases where remap != .swapLeftOptionCommand {
+            let injector = makeInjector(remap: remap)
+            injector.handleKey(hidUsage: KeyboardMap.HID.leftOption, down: true)
+            injector.handleKey(hidUsage: KeyboardMap.HID.leftShift, down: true)
+            injector.handleKey(hidUsage: 0x50, down: true)
+            XCTAssertEqual(sink.events.last?.keyCode, 0x7B)
+            XCTAssertTrue(sink.events.last?.flags.contains(.maskShift) ?? false)
+        }
+        for extra in [KeyboardMap.HID.leftCommand, KeyboardMap.HID.rightOption, UInt16(0)] {
+            let injector = makeInjector(remap: .swapLeftOptionCommand)
+            injector.handleKey(hidUsage: KeyboardMap.HID.leftOption, down: true)
+            injector.handleKey(hidUsage: KeyboardMap.HID.leftShift, down: true)
+            if extra == 0 { injector.setStickyModifiers(KeyboardMap.uiAlternate) }
+            else { injector.handleKey(hidUsage: extra, down: true) }
+            injector.handleKey(hidUsage: 0x4F, down: true)
+            XCTAssertEqual(sink.events.last?.flags.intersection([.maskCommand, .maskShift, .maskAlternate]),
+                           [.maskCommand, .maskShift, .maskAlternate])
+        }
+        let injector = makeInjector(remap: .swapLeftOptionCommand)
+        injector.handleKey(hidUsage: KeyboardMap.HID.rightCommand, down: true)
+        injector.handleKey(hidUsage: KeyboardMap.HID.leftShift, down: true)
+        injector.handleKey(hidUsage: 0x50, down: true)
+        XCTAssertTrue(sink.events.last?.flags.contains(.maskShift) ?? false)
+        XCTAssertFalse(sink.events.last?.flags.contains(.maskAlternate) ?? true)
+        injector.reset()
+        injector.handleKey(hidUsage: KeyboardMap.HID.leftOption, down: true)
+        injector.handleKey(hidUsage: KeyboardMap.HID.leftShift, down: true)
+        injector.handleKey(hidUsage: KeyboardMap.HID.leftControl, down: true)
+        injector.handleKey(hidUsage: 0x50, down: true)
+        XCTAssertTrue(sink.events.last?.flags.contains(.maskShift) ?? false)
+        XCTAssertFalse(sink.events.last?.flags.contains(.maskAlternate) ?? true)
+        injector.handleKey(hidUsage: KeyboardMap.HID.leftControl, down: false)
+        injector.handleKey(hidUsage: 0x04, down: true)
+        XCTAssertTrue(sink.events.last?.flags.contains(.maskShift) ?? false)
+        XCTAssertFalse(sink.events.last?.flags.contains(.maskAlternate) ?? true)
+        injector.handlePointerMove(x: 0.5, y: 0.5)
+        XCTAssertTrue(sink.events.last?.flags.contains(.maskShift) ?? false)
+        XCTAssertFalse(sink.events.last?.flags.contains(.maskAlternate) ?? true)
+        sink.reset()
+        injector.reset()
+        XCTAssertTrue(sink.events.last?.flags.intersection([.maskShift, .maskCommand, .maskAlternate]).isEmpty ?? false)
+        sink.reset()
+        scheduler.tickAfterCancel()
+        injector.handlePointerMove(x: 0.5, y: 0.5)
+        XCTAssertTrue(sink.events.allSatisfy { $0.flags.intersection([.maskShift, .maskCommand, .maskAlternate]).isEmpty })
+        injector.handleKey(hidUsage: KeyboardMap.HID.leftOption, down: true)
+        injector.handleKey(hidUsage: KeyboardMap.HID.leftShift, down: true)
+        injector.handleKey(hidUsage: 0x4F, down: true)
+        sink.reset()
+        injector.reset()
+        XCTAssertEqual(sink.events.first?.type, .keyUp)
+        XCTAssertEqual(sink.events.first?.keyCode, 0x7C)
+        XCTAssertEqual(sink.events.first?.flags.intersection([.maskShift, .maskCommand, .maskAlternate]),
+                       [.maskCommand, .maskAlternate])
+        XCTAssertTrue(sink.events.filter { $0.type == .flagsChanged }.allSatisfy {
+            !$0.flags.contains(.maskAlternate)
+        })
+    }
+
     func testALostModifierKeyUpIsRepairedByTheNextKeysModifierSnapshot() {
         // swapLeftOptionCommand: physical left Option is Command, so an arrow
-        // chord held as "left Option + Shift" must reach the Mac as ⌘⇧←/→. If
+        // chord held as "left Option + Shift" sends the tab chord ⌘⌥←/→. If
         // the left Option key-up is lost, this injector keeps Command held and
         // every later arrow is a ⌘-arrow — a shortcut the user cannot get out
         // of from the iPad. The next non-modifier press carries a fresh
@@ -300,8 +405,7 @@ final class KeyboardInjectionTests: XCTestCase {
                            rawModifiers: KeyboardMap.uiAlternate | KeyboardMap.uiShift)
         sink.reset()
 
-        // Both arrows, each carrying the full snapshot: Command+Shift, and not
-        // the Option a raw reading of the `.alternate` bit would have produced.
+        // Both arrows send the tab alias without changing tracked modifiers.
         injector.handleKey(hidUsage: 0x4F, down: true,   // right arrow
                            rawModifiers: KeyboardMap.uiAlternate | KeyboardMap.uiShift)
         injector.handleKey(hidUsage: 0x50, down: true,   // left arrow
@@ -312,9 +416,8 @@ final class KeyboardInjectionTests: XCTestCase {
         XCTAssertEqual(arrowDowns.count, 2)
         for down in arrowDowns {
             XCTAssertTrue(down.flags.contains(.maskCommand))
-            XCTAssertTrue(down.flags.contains(.maskShift))
-            XCTAssertFalse(down.flags.contains(.maskAlternate),
-                           "left Option is Command under this remap, not Option")
+            XCTAssertFalse(down.flags.contains(.maskShift))
+            XCTAssertTrue(down.flags.contains(.maskAlternate))
         }
         sink.reset()
 

@@ -788,6 +788,21 @@ final class InputInjector {
         let navigationFlags: CGEventFlags = !isModifier && (0x7B...0x7E).contains(virtualKey)
             ? [.maskNumericPad, .maskSecondaryFn] : []
         event.flags = flags.union(navigationFlags)
+        // In the left-key swap mode, Option+Shift+horizontal arrow is the
+        // tab chord. Translate only this event, including repeats and ups;
+        // physical modifier state must remain intact for other keys/clicks.
+        if commandKeyRemap == .swapLeftOptionCommand, !isModifier,
+           virtualKey == 0x7B || virtualKey == 0x7C,
+           modifiers.held.contains(KeyboardMap.HID.leftOption),
+           flags.contains([.maskCommand, .maskShift]),
+           flags.intersection([.maskAlternate, .maskControl]).isEmpty {
+            event.flags.subtract(KeyboardMap.flags(forModifier: KeyboardMap.HID.leftShift,
+                                                   commandKeyRemap: .none))
+            event.flags.subtract(KeyboardMap.flags(forModifier: KeyboardMap.HID.rightShift,
+                                                   commandKeyRemap: .none))
+            event.flags.formUnion(KeyboardMap.flags(forModifier: KeyboardMap.HID.leftOption,
+                                                    commandKeyRemap: .none))
+        }
         if autorepeat { event.setIntegerValueField(.keyboardEventAutorepeat, value: 1) }
         sink.post(event)
     }
