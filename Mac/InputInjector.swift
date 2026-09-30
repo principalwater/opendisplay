@@ -490,17 +490,20 @@ final class InputInjector {
     /// The snapshot is the touch event's physical keyboard state; unlike a
     /// timeout it keeps a deliberately held modifier available for a click.
     func reconcileModifiers(reported rawModifiers: UInt) {
-        withState {
-            for usage in modifiers.missing(from: rawModifiers) {
-                modifiers.update(hidUsage: usage, down: false)
-                guard let key = KeyboardMap.macKeyCode(for: usage,
-                                                       commandKeyRemap: commandKeyRemap) else { continue }
-                var flags = modifiers.flags(reported: rawModifiers, includeReported: false,
-                                            commandKeyRemap: commandKeyRemap)
-                if keyRemapPlan.claimsCapsLock { flags.subtract(.maskAlphaShift) }
-                post(virtualKey: key, down: false, flags: flags,
-                     isModifier: true, autorepeat: false)
-            }
+        withState { lockedReconcileModifiers(reported: rawModifiers) }
+    }
+
+    /// Shared by touch snapshots and key presses while `stateLock` is held.
+    private func lockedReconcileModifiers(reported rawModifiers: UInt) {
+        for usage in modifiers.missing(from: rawModifiers) {
+            modifiers.update(hidUsage: usage, down: false)
+            guard let key = KeyboardMap.macKeyCode(for: usage,
+                                                   commandKeyRemap: commandKeyRemap) else { continue }
+            var flags = modifiers.flags(reported: rawModifiers, includeReported: false,
+                                        commandKeyRemap: commandKeyRemap)
+            if keyRemapPlan.claimsCapsLock { flags.subtract(.maskAlphaShift) }
+            post(virtualKey: key, down: false, flags: flags,
+                 isModifier: true, autorepeat: false)
         }
     }
 
@@ -509,6 +512,9 @@ final class InputInjector {
     /// - `hidUsage`: USB HID Keyboard/Keypad usage page (0x07) code, i.e.
     ///   `UIKey.keyCode.rawValue` straight off the wire.
     /// - `rawModifiers`: `UIKeyModifierFlags` bitmask at the time of the press.
+    ///   `nil` means the sender omitted it (the legacy wire shape): the tracked
+    ///   modifier state is then trusted as is, exactly as it was before this
+    ///   argument could carry a snapshot.
     /// - `characters`: `UIKey.characters`, used **only** when the usage has no
     ///   macOS virtual keycode. For everything else the keycode is forwarded
     ///   and the Mac's own input source decides the character, which is what
@@ -523,10 +529,15 @@ final class InputInjector {
     ///      overrode the Mac's input source and pinned everything to whatever
     ///      layout the iPad had selected;
     ///   3. a held key auto-repeats (see KeyRepeat.swift).
-    func handleKey(hidUsage: UInt16, down: Bool, rawModifiers: UInt = 0, characters: String? = nil) {
+    func handleKey(hidUsage: UInt16, down: Bool, rawModifiers: UInt? = nil, characters: String? = nil) {
         withState {
+            // A key press can repair a lost modifier release before computing
+            // its flags. Modifier transitions and omitted snapshots stay exact.
+            if down, let rawModifiers, !KeyboardMap.isModifier(hidUsage) {
+                lockedReconcileModifiers(reported: rawModifiers)
+            }
             lockedHandleKey(hidUsage: hidUsage, down: down,
-                            rawModifiers: rawModifiers, characters: characters)
+                            rawModifiers: rawModifiers ?? 0, characters: characters)
         }
     }
 

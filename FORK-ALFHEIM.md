@@ -9,6 +9,25 @@ credentials, and development logs are not included in this branch.
 
 ## Added behavior
 
+### Sender 1.22.3
+
+The encoder permits two in-flight frames and uses normal real-time rate
+control by default. The previous single-frame gate skipped every other 120 Hz
+capture when encoding took more than 8.3 ms. A native NV12 benchmark measured
+about 60 outputs/s with that gate and about 112 outputs/s with the new settings;
+live receiver delivery and presentation still require validation. The existing
+`lowlatency` override remains available for hardware comparisons.
+
+VideoToolbox completions enter the serial sender queue before touching framing
+or the network queue. Retired capture, encoder and connection completions are
+excluded, and reconnects no longer reset the count of still-running encodes.
+Display restoration and external watchdog timing are unchanged.
+
+A hardware key press reconciles a supplied modifier snapshot before injection,
+so a lost modifier release does not keep Command latched on later keystrokes.
+Deliberately held modifiers remain held; legacy events without a snapshot keep
+the previous behavior. The wire protocol and 1.22.0 receiver are unchanged.
+
 ### Sender 1.22.2
 
 Reconnects identify the live connection by an object reference, so a reused

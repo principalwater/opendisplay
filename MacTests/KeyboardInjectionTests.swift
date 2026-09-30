@@ -169,6 +169,63 @@ final class KeyboardInjectionTests: XCTestCase {
         XCTAssertTrue(sink.events.first?.flags.contains(.maskAlternate) ?? false)
     }
 
+    func testALostModifierKeyUpIsRepairedByTheNextKeysModifierSnapshot() {
+        // swapLeftOptionCommand: physical left Option is Command, so an arrow
+        // chord held as "left Option + Shift" must reach the Mac as ⌘⇧←/→. If
+        // the left Option key-up is lost, this injector keeps Command held and
+        // every later arrow is a ⌘-arrow — a shortcut the user cannot get out
+        // of from the iPad. The next non-modifier press carries a fresh
+        // physical-key snapshot, and a snapshot reporting only Shift is the
+        // evidence that repairs it: Command is released, Shift is kept.
+        let injector = makeInjector(remap: .swapLeftOptionCommand)
+        injector.handleKey(hidUsage: KeyboardMap.HID.leftOption, down: true,
+                           rawModifiers: KeyboardMap.uiAlternate)
+        injector.handleKey(hidUsage: KeyboardMap.HID.leftShift, down: true,
+                           rawModifiers: KeyboardMap.uiAlternate | KeyboardMap.uiShift)
+        sink.reset()
+
+        // Both arrows, each carrying the full snapshot: Command+Shift, and not
+        // the Option a raw reading of the `.alternate` bit would have produced.
+        injector.handleKey(hidUsage: 0x4F, down: true,   // right arrow
+                           rawModifiers: KeyboardMap.uiAlternate | KeyboardMap.uiShift)
+        injector.handleKey(hidUsage: 0x50, down: true,   // left arrow
+                           rawModifiers: KeyboardMap.uiAlternate | KeyboardMap.uiShift)
+        XCTAssertTrue(sink.events.filter { $0.type == .flagsChanged }.isEmpty,
+                      "a snapshot that reports every held modifier must not release one")
+        let arrowDowns = sink.events.filter { $0.type == .keyDown }
+        XCTAssertEqual(arrowDowns.count, 2)
+        for down in arrowDowns {
+            XCTAssertTrue(down.flags.contains(.maskCommand))
+            XCTAssertTrue(down.flags.contains(.maskShift))
+            XCTAssertFalse(down.flags.contains(.maskAlternate),
+                           "left Option is Command under this remap, not Option")
+        }
+        sink.reset()
+
+        // The left Option key-up is lost. The next arrow reports only Shift, so
+        // the Command left Option stood in for is released — and the Shift the
+        // snapshot still reports is preserved.
+        injector.handleKey(hidUsage: 0x51, down: true,   // down arrow
+                           rawModifiers: KeyboardMap.uiShift)
+        XCTAssertEqual(sink.events.map(\.type), [.flagsChanged, .keyDown])
+        XCTAssertEqual(sink.events.first?.keyCode, 0x37,
+                       "left Option's Command is the modifier released")
+        XCTAssertFalse(sink.events.first?.flags.contains(.maskCommand) ?? true)
+        XCTAssertTrue(sink.events.first?.flags.contains(.maskShift) ?? false,
+                      "Shift is still physically held and must survive the repair")
+        XCTAssertFalse(sink.events.last?.flags.contains(.maskAlternate) ?? true)
+        XCTAssertTrue(sink.events.last?.flags.contains(.maskShift) ?? false)
+        sink.reset()
+
+        // A later snapshot that does report the modifier still held leaves it
+        // alone: no second release, Shift stamped on the key.
+        injector.handleKey(hidUsage: 0x52, down: true,   // up arrow
+                           rawModifiers: KeyboardMap.uiShift)
+        XCTAssertEqual(sink.events.map(\.type), [.keyDown],
+                       "a fully reported held modifier is preserved, not released")
+        XCTAssertTrue(sink.events.first?.flags.contains(.maskShift) ?? false)
+    }
+
     func testControlGraveLeavesCommandGraveForWindowCycling() {
         let injector = makeInjector(remap: .swapLeftOptionCommand, escapeKey: .controlGrave)
         injector.handleKey(hidUsage: KeyboardMap.HID.leftOption, down: true,

@@ -3006,7 +3006,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             // number on this path is range-checked, never converted blindly.
             if let code = obj["code"] as? Int, let usage = WireInput.hidUsage(code),
                let down = obj["down"] as? Bool {
-                let mod = WireInput.modifierMask(obj["mod"] as? Int)
+                let mod = obj["mod"] == nil ? nil : WireInput.modifierMask(obj["mod"] as? Int)
                 let char = obj["char"] as? String
                 inputInjector?.handleKey(hidUsage: usage, down: down,
                                          rawModifiers: mod, characters: char)
