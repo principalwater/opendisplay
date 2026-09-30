@@ -381,18 +381,15 @@ struct DelayBaseline: Equatable {
 ///
 /// The order is the design. `senderBacklog` needs nothing from the far end and
 /// is true the instant it is true; `delayGradient` needs a fresh report but
-/// sees congestion with zero drops; `receiverDrops` is last because by the
-/// time frames are late the queue has already been full for a while.
+/// sees congestion even when no frames have been evicted.
 enum CongestionSignal: String, Equatable, CaseIterable {
     case senderBacklog
     case delayGradient
-    case receiverDrops
 
     var label: String {
         switch self {
         case .senderBacklog: return "sender-backlog"
         case .delayGradient: return "delay-gradient"
-        case .receiverDrops: return "receiver-drops"
         }
     }
 }
@@ -436,10 +433,8 @@ enum LinkHealth {
             return .congested(.delayGradient)
         }
 
-        // (c) Drop counters, last.
-        if sample.receiverIsFresh, sample.receiverStalls > 0 {
-            return .congested(.receiverDrops)
-        }
+        // Receiver `stalls` count arrival gaps >50ms, including idle capture
+        // and encoder pacing. They do not establish network congestion.
 
         // Clean means nothing went wrong, not "not much did" — recovery is the
         // direction that can make things worse, so its bar is the higher one.
@@ -452,8 +447,7 @@ enum LinkHealth {
             && sample.oldestWriteAgeMs <= stalledWriteMs / 2
         guard senderClean else { return .neither }
         if sample.receiverIsFresh {
-            guard sample.receiverStalls == 0,
-                  !baseline.isQueueBuilding(e2eP50Ms: sample.receiverE2eP50Ms,
+            guard !baseline.isQueueBuilding(e2eP50Ms: sample.receiverE2eP50Ms,
                                             e2eP95Ms: sample.receiverE2eP95Ms)
             else { return .neither }
         }
@@ -790,7 +784,8 @@ struct AdaptiveQualityController {
                                   levelIndex)
             self.estimator.seed(Double(targetBps) / Self.targetShareOfEstimate)
         }
-        self.startupProbing = knownTailnetEndpoint && requestedBps > targetBps
+        self.startupProbing = targetBps < plan.configuredBitrateBps
+            && (pathClass == .lan || (knownTailnetEndpoint && requestedBps > targetBps))
         self.stableSince = now
         self.cleanSince = now
     }
@@ -824,7 +819,8 @@ struct AdaptiveQualityController {
                                         knownTailnetEndpoint: knownTailnetEndpoint, plan: plan)
             levelIndex = max(min(max(0, remembered.levelIndex), plan.levels.count - 1),
                              plan.viableIndex(targetBps: targetBps))
-            startupProbing = knownTailnetEndpoint && requestedBps > targetBps
+            startupProbing = targetBps < plan.configuredBitrateBps
+                && (newClass == .lan || (knownTailnetEndpoint && requestedBps > targetBps))
         } else if knownTailnetEndpoint {
             // A connection can first look local before its routed endpoint is
             // known. Even without a saved point, correct that optimistic start.
@@ -901,7 +897,7 @@ struct AdaptiveQualityController {
                 ? Self.startupProbeSeconds : Self.increaseAfterCleanSeconds
             guard now - since >= cleanHold else { return nil }
             guard canChange(at: now) else { return nil }
-            return increase(at: now)
+            return increase(at: now, receiverIsFresh: sample.receiverIsFresh)
         case .neither:
             // Neither clock advances. A link that is merely imperfect holds its
             // operating point, which is what stops the controller walking up
@@ -926,7 +922,8 @@ struct AdaptiveQualityController {
     /// The point, once it has held still long enough to be worth remembering.
     func stableOperatingPoint(at now: TimeInterval) -> OperatingPoint? {
         guard pathClass == .lan || knownTailnetEndpoint else { return nil }
-        guard let stableSince, now - stableSince >= OperatingPointStore.stableAfterSeconds
+        guard cleanSince != nil,
+              let stableSince, now - stableSince >= OperatingPointStore.stableAfterSeconds
         else { return nil }
         return OperatingPoint(targetKbps: max(1, targetBps / 1000), levelIndex: levelIndex)
     }
@@ -994,7 +991,7 @@ struct AdaptiveQualityController {
 
     // ── Additive increase ──────────────────────────────────────────────────
 
-    private mutating func increase(at now: TimeInterval) -> Change? {
+    private mutating func increase(at now: TimeInterval, receiverIsFresh: Bool) -> Change? {
         let previousTarget = targetBps
         let previousLevel = level
 
@@ -1013,7 +1010,8 @@ struct AdaptiveQualityController {
         }
         ceiling = max(ceiling, plan.floorBps)
 
-        let increaseFactor = startupProbing ? Self.startupProbeFactor : Self.increaseFactor
+        let increaseFactor = startupProbing && receiverIsFresh
+            ? Self.startupProbeFactor : Self.increaseFactor
         var next = Self.clamp(min(Int((Double(previousTarget) * increaseFactor).rounded()),
                                   ceiling), plan: plan)
         if next < previousTarget { next = previousTarget }

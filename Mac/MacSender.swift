@@ -273,7 +273,9 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     private var loggedAudioUnsupportedPeer = false
     /// The connection `becomeReady` last ran its per-connection resets for.
     /// `queue` only.
-    private var readyConnection: ObjectIdentifier?
+    // A bare ObjectIdentifier outlives its object; a later dial can reuse the
+    // address and accidentally inherit tagged framing and admission.
+    private weak var readyConnection: NWConnection?
 
     // MARK: - Audio/video queue boundary
     //
@@ -399,6 +401,9 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     private var helloContinuation: CheckedContinuation<PhoneInfo, Error>?
     private var admissionGranted = false { didSet { refreshAudioGate() } }
     private var admissionRequired = false { didSet { refreshAudioGate() } }
+    private var videoDeliveryActive: Bool {
+        connectionReady && (!admissionRequired || admissionGranted)
+    }
     private var admissionContinuation: CheckedContinuation<Void, Error>?
     // The injector is created by the capture setup task, used from the
     // connection's receive queue, and reset from the main actor — three
@@ -1593,10 +1598,18 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         dialTimeoutLog.reset()
         dialWaitingLog.reset()
         Log.info("connection ready to \(endpointName)")
-        let isNewConnection = readyConnection != ObjectIdentifier(conn)
+        let isNewConnection = readyConnection !== conn
+        if !isNewConnection {
+            connectionReady = true
+            refreshDirectLinkClassification(for: conn)
+            Log.info("connection re-reported ready — keeping the handshake and receive loop")
+            return
+        }
         if isNewConnection {
             admissionGranted = false
-            admissionRequired = false
+            // Until hello arrives, neither legacy support nor admission is
+            // known. Control messages remain available to finish the greeting.
+            admissionRequired = true
             peerSpeaksTaggedFrames = false
         }
         connectionReady = true
@@ -1621,7 +1634,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         // The receiver's own re-hello triggers (`Shared/StreamReceiver`: panel
         // change, cursor port, address change, unmute) reopen it; nothing
         // should be able to need them.
-        readyConnection = ObjectIdentifier(conn)
+        readyConnection = conn
         if isNewConnection {
             // Same reasoning, and the same scope: a different receiver may not
             // understand the stamp. It is re-asserted by the next `hello`,
@@ -1630,9 +1643,6 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             audioLock.lock()
             peerWantsAudioSequenceForEncoder = false
             audioLock.unlock()
-        } else {
-            Log.info("connection re-reported ready — keeping the handshake "
-                     + "(receiver \(peerSpeaksTaggedFrames ? "speaks" : "has not claimed") tagged framing)")
         }
         // A new receiver has no codec config, so the next packet must carry it.
         // The "peer is too old for audio" log-once flag lives on the audio
@@ -2266,7 +2276,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 
     private func adaptiveTick() {
-        guard connectionReady, encoder != nil, var controller = adaptive else { return }
+        guard videoDeliveryActive, encoder != nil, var controller = adaptive else { return }
         let now = ProcessInfo.processInfo.systemUptime
         let tickSeconds = lastAdaptiveTickAt > 0 ? max(now - lastAdaptiveTickAt, 0.05) : 0.5
         lastAdaptiveTickAt = now
@@ -2806,6 +2816,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         switch type {
         case WireMessage.admitted:
             admissionGranted = true
+            needsKeyframe = true
             if let port = lastHello?.cursorPort { openCursorChannel(port: port) }
             admissionContinuation?.resume()
             admissionContinuation = nil
@@ -3436,7 +3447,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 
     private func encode(_ pixelBuffer: CVPixelBuffer, pts: CMTime, generation: UInt64) {
-        guard generation == captureGenerationNow, let encoder else { return }
+        guard videoDeliveryActive, generation == captureGenerationNow, let encoder else { return }
         // A cached buffer from before a scale change belongs to a different
         // compression session. The replay paths (`replayLastFrameAfterDrop`,
         // the watchdog's static-screen IDR) reach here without going past the
@@ -3709,7 +3720,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     /// caller), which is the only executor allowed to touch `connection` and
     /// therefore the only one allowed to touch the queue.
     private func sendFramed(_ payload: Data) {
-        guard let connection, connectionReady else { return }
+        guard let connection, videoDeliveryActive else { return }
         let frame = FrameCodec.encode(payload, type: .video,
                                       tagged: peerSpeaksTaggedFrames)
         let evicted = sendQueue.enqueue(frame)
@@ -3738,7 +3749,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         writeStartedAt = startedAt
         publishSendQueueDepth()
         connection.send(content: frame, completion: .contentProcessed { [weak self] error in
-            guard let self else { return }
+            guard let self, self.connection === connection else { return }
             // `NWConnection` completions arrive on the connection's queue,
             // which is `queue` — the same executor the rest of this state
             // lives on, so no hop and no lock is needed for the queue itself.

@@ -311,11 +311,12 @@ final class AdaptiveQualityTests: XCTestCase {
                        .congested(.delayGradient))
     }
 
-    func testReceiverStallsAreCongestionAndAreRankedLast() {
+    func testIdleFrameGapsAreNotNetworkCongestion() {
         let sample = LinkSample(sendQueueDepth: 0, framesEncoded: 60,
-                                receiverIsFresh: true, receiverStalls: 7)
+                                receiverIsFresh: true, receiverE2eP50Ms: 17,
+                                receiverE2eP95Ms: 24, receiverStalls: 7)
         XCTAssertEqual(LinkHealth.verdict(sample, baseline: DelayBaseline()),
-                       .congested(.receiverDrops))
+                       .clean, "stalls count arrival gaps, including idle capture")
     }
 
     func testTheSendersOwnBacklogOutranksEverythingTheReceiverSays() {
@@ -751,6 +752,28 @@ final class AdaptiveQualityTests: XCTestCase {
         XCTAssertNotNil(controller.stableOperatingPoint(at: 25))
         run(&controller, congested(), seconds: 3, from: 25)
         XCTAssertNil(controller.stableOperatingPoint(at: 30))
+    }
+
+    func testContinuousBacklogAtTheFloorIsNeverRememberedAsStable() {
+        var controller = self.controller(start: OperatingPoint(targetKbps: 800, levelIndex: 4))
+        controller.noteApplied(at: 0)
+        run(&controller, congested(), seconds: 30)
+        XCTAssertNil(controller.stableOperatingPoint(at: 30))
+    }
+
+    func testRememberedLowLanPointRecoversWithFiveSecondReceiverReports() {
+        var controller = self.controller(start: OperatingPoint(targetKbps: 800, levelIndex: 2))
+        for tick in 1...70 {
+            let sample = LinkSample(framesEncoded: 15, bytesDelivered: 50_000,
+                                    receiverIsFresh: tick % 10 == 0,
+                                    receiverE2eP50Ms: 17, receiverE2eP95Ms: 24,
+                                    receiverStalls: 3)
+            if controller.ingest(sample, at: Double(tick) / 2) != nil {
+                controller.noteApplied(at: Double(tick) / 2)
+            }
+        }
+        XCTAssertEqual(controller.targetBps, 28_800_000)
+        XCTAssertEqual(controller.levelIndex, 0)
     }
 
     func testReclassifyingAdoptsTheOtherClassesPointOnlyBeforeAnythingWasDecided() {

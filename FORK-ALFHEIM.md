@@ -9,6 +9,22 @@ credentials, and development logs are not included in this branch.
 
 ## Added behavior
 
+### Sender 1.22.2
+
+Reconnects identify the live connection by an object reference, so a reused
+allocation address cannot inherit the previous peer's framing or admission.
+Video and adaptation wait for the new greeting and admission; retired write
+callbacks cannot change the replacement connection's send queue. Repeated
+ready notifications keep one control receive loop.
+
+Adaptive quality no longer treats frame arrival gaps as network drops: idle
+capture and encoder pacing create those gaps too. Sender backlog and measured
+delivery delay remain congestion signals. A congested point at the bitrate
+floor is not saved as stable. Remembered low LAN points probe upward with fresh
+clean receiver reports; without a report, increases remain 10% every 15 seconds.
+The wire protocol and existing 1.22.0 iPad receiver remain compatible. Display
+watchdogs, restoration timing, bundle identity and signing identity are unchanged.
+
 - Hardware keyboard passthrough, key repeat, a selectable Command-key stand-in,
   pointer hover, secondary click, scrolling, and native touch gestures.
 - A left Option/Command swap and a Control+backtick Escape binding are available
