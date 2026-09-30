@@ -11,6 +11,12 @@ credentials, and development logs are not included in this branch.
 
 ### Sender 1.22.4
 
+A nonmodifier key-up ignores UIKit's fallback modifier snapshot, which can
+retain a chord's original Option or Command after that modifier was released.
+Tracked held modifiers and the on-screen sidebar still apply to key-up; key-down
+keeps the fallback for modifiers pressed before the video view had focus.
+This prevents the stale key-up from reasserting a released swapped modifier.
+
 Injected arrow keys keep the native macOS NumericPad and Fn key-class flags
 on both press and release. This preserves the native navigation event shape
 for remapped Command+Shift+arrow shortcuts even when UIKit reports only the

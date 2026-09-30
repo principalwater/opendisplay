@@ -550,8 +550,10 @@ final class InputInjector {
         // `.flagsChanged`. Stamping them there would assert a modifier the
         // Window Server was never told went down, and the next real modifier
         // release would look like that virtual one going up too.
+        // UIKit can retain a chord's original modifiers on key-up, after
+        // the modifier itself has gone up. Only a new press can add fallback flags.
         var flags = modifiers.flags(reported: rawModifiers,
-                                    includeReported: !isModifier,
+                                    includeReported: down && !isModifier,
                                     commandKeyRemap: commandKeyRemap,
                                     sticky: isModifier ? [] : stickyModifiers)
         // With Caps Lock remapped, the Mac's own latch is never toggled — so

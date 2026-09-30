@@ -492,12 +492,10 @@ struct ModifierKeyState {
     /// Flags to stamp on an injected event.
     ///
     /// - `reported`: the `mod` field from the wire (UIKeyModifierFlags bits).
-    /// - `includeReported`: false for a modifier key's own event. UIKit may or
-    ///   may not have already folded that key into `modifierFlags`, so for the
-    ///   event that *is* the transition we trust only our own tracked set,
-    ///   which is exact. For every other key the two are unioned, so a
-    ///   modifier that went down while the video view was not first responder
-    ///   still reaches the Mac.
+    /// - `includeReported`: true only for nonmodifier key-down. Modifier
+    ///   transitions trust the tracked set; key-up snapshots can retain the
+    ///   chord's original modifiers after their release. On a new press the
+    ///   fallback still carries modifiers pressed before the view had focus.
     /// - `sticky`: the on-screen modifier sidebar's latched flags (#247).
     func flags(reported: UInt,
                includeReported: Bool,

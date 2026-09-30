@@ -169,6 +169,42 @@ final class KeyboardInjectionTests: XCTestCase {
         XCTAssertTrue(sink.events.first?.flags.contains(.maskAlternate) ?? false)
     }
 
+    func testStaleChordKeyUpCannotReassertAReleasedSwappedModifier() {
+        // Releasing the modifier before the chord key must not restore the
+        // original physical modifier from the key's stale UIKit snapshot.
+        for (usage, raw) in [(KeyboardMap.HID.leftOption, KeyboardMap.uiAlternate),
+                             (KeyboardMap.HID.leftCommand, KeyboardMap.uiCommand)] {
+            let injector = makeInjector(remap: .swapLeftOptionCommand)
+            injector.handleKey(hidUsage: usage, down: true, rawModifiers: raw)
+            injector.handleKey(hidUsage: 0x0F, down: true, rawModifiers: raw)
+            injector.handleKey(hidUsage: usage, down: false, rawModifiers: raw)
+            sink.reset()
+
+            injector.handleKey(hidUsage: 0x0F, down: false, rawModifiers: raw)
+            XCTAssertEqual(sink.events.map(\.type), [.keyUp])
+            XCTAssertTrue(sink.events[0].flags.intersection([.maskCommand, .maskAlternate]).isEmpty,
+                          "a chord key-up cannot press a modifier that has already gone up")
+        }
+    }
+
+    func testKeyUpKeepsDeliberatelyHeldAndSidebarModifiers() {
+        for (usage, raw, expected) in [
+            (KeyboardMap.HID.leftOption, KeyboardMap.uiAlternate, CGEventFlags.maskCommand),
+            (KeyboardMap.HID.leftCommand, KeyboardMap.uiCommand, CGEventFlags.maskAlternate)
+        ] {
+            let injector = makeInjector(remap: .swapLeftOptionCommand)
+            injector.setStickyModifiers(KeyboardMap.uiControl)
+            injector.handleKey(hidUsage: usage, down: true, rawModifiers: raw)
+            injector.handleKey(hidUsage: 0x0F, down: true, rawModifiers: raw)
+            sink.reset()
+
+            injector.handleKey(hidUsage: 0x0F, down: false, rawModifiers: 0)
+            XCTAssertEqual(sink.events.map(\.type), [.keyUp])
+            XCTAssertEqual(sink.events[0].flags.intersection([.maskCommand, .maskAlternate]), expected)
+            XCTAssertTrue(sink.events[0].flags.contains(.maskControl))
+        }
+    }
+
     func testRemappedShiftArrowsKeepNativeNavigationFlags() {
         // UIKit may omit the arrow's key-class flags. Overwriting CGEvent's
         // native flags must not turn a Command+Shift arrow into a plain key.
