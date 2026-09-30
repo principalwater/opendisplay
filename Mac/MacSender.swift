@@ -187,20 +187,17 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     // poisoned one.
     private var baseIdentityOffset: UInt32
 
-    // ── Encoder parallelism limiter (maxPendingEncodes = 1) ─────────────────
-    //
-    // VTCompressionSessionEncodeFrame returns immediately; the hardware H.264
-    // encoder runs asynchronously. If ScreenCaptureKit delivers the next frame
-    // before the previous encode callback fires, VideoToolbox will run multiple
-    // encodes in parallel inside the same session.
-    //
-    // Capping pendingEncodes at 1 enforces “latest frame wins” on the encoder:
-    // skip captures while an encode is in flight (enc drops), then feed the next
-    // fresh buffer when the callback clears the slot. The H.264 reference chain
-    // stays valid (pre-encode skip → normal P-frame n→n+2); we do NOT force
-    // keyframes on enc drops.
+    // One in-flight frame skips every other 120 Hz capture when an encode
+    // takes longer than 8.3 ms. Two overlap hardware work while bounding
+    // latency; captures beyond that still use latest-frame-wins backpressure.
     private var pendingEncodes = 0
-    private let maxPendingEncodes = 1
+    private let maxPendingEncodes = 2
+    private var encoderGeneration: UInt64 = 0
+    private var encoderGenerationNow: UInt64 {
+        pipelineLock.lock()
+        defer { pipelineLock.unlock() }
+        return encoderGeneration
+    }
 
     // ── Latency-first send queue (see Mac/VideoSendQueue.swift) ─────────────
     //
@@ -1356,9 +1353,6 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             self.closeCursorChannel()
             self.stopUpgradeProbing()
             self.resetSendQueue()
-            self.pipelineLock.lock()
-            self.pendingEncodes = 0
-            self.pipelineLock.unlock()
             self.connect()
         }
     }
@@ -2058,9 +2052,6 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         connection = nil
         closeCursorChannel()   // rebuilt from the next hello
         resetSendQueue()
-        pipelineLock.lock()
-        pendingEncodes = 0
-        pipelineLock.unlock()
         queue.asyncAfter(deadline: .now() + 1.0) { [weak self] in
             // Generation-guarded so a switchTransport (or another reconnect)
             // that landed in this 1s window supersedes this dial instead of
@@ -3123,10 +3114,10 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 
     private func setupEncoder(width: Int, height: Int) throws {
-        // Low-latency rate control: the hardware encoder emits every frame
-        // immediately instead of pipelining. (`-lowlatency NO` for A/B.)
-        let lowLatency = UserDefaults.standard.object(forKey: "lowlatency") == nil
-            || UserDefaults.standard.bool(forKey: "lowlatency")
+        // At native 120 Hz, the optional low-latency rate controller measured
+        // slower than the normal real-time encoder. Keep the existing override
+        // for hardware-specific comparisons, with normal rate control by default.
+        let lowLatency = UserDefaults.standard.bool(forKey: "lowlatency")
         // The spec filters which encoder VideoToolbox is allowed to pick, so an
         // unsupported key fails creation outright rather than being ignored the
         // way the properties below are: this key *requires* an encoder that
@@ -3184,6 +3175,10 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         VTSessionSetProperty(encoder, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: timing.expectedFrameRate as CFNumber)
         VTSessionSetProperty(encoder, key: kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality, value: kCFBooleanTrue)
         VTCompressionSessionPrepareToEncodeFrames(encoder)
+        pipelineLock.lock()
+        encoderGeneration &+= 1
+        pendingEncodes = 0
+        pipelineLock.unlock()
         encoderSize = (width, height)
         Log.info("encoder ready: \(width)x\(height) H.264 \(startBitrate / 1_000_000)Mbps"
                  + "\(startBitrate == effectiveBitrate ? "" : " (ceiling \(effectiveBitrate / 1_000_000)Mbps)")"
@@ -3456,7 +3451,9 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
               CVPixelBufferGetHeight(pixelBuffer) == encoderSize.high else { return }
         pipelineLock.lock()
         pendingEncodes += 1
+        let encoderGeneration = self.encoderGeneration
         pipelineLock.unlock()
+        let connection = self.connection
         let capturedAtMs = Int64(Date().timeIntervalSince1970 * 1000)
         var frameProperties: CFDictionary?
         if needsKeyframe {
@@ -3474,7 +3471,9 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             guard let self else { return }
             defer {
                 self.pipelineLock.lock()
-                self.pendingEncodes = max(0, self.pendingEncodes - 1)
+                if encoderGeneration == self.encoderGeneration {
+                    self.pendingEncodes = max(0, self.pendingEncodes - 1)
+                }
                 self.pipelineLock.unlock()
             }
             guard status == noErr, let buffer else {
@@ -3494,7 +3493,12 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                 let sndMs = Int64(Date().timeIntervalSince1970 * 1000)
                 var framed = Data("{\"cap\":\(capturedAtMs),\"snd\":\(sndMs)}".utf8)
                 framed.append(data)
-                self.sendFramed(framed)
+                self.queue.async { [weak self] in
+                    guard let self, generation == self.captureGenerationNow,
+                          encoderGeneration == self.encoderGenerationNow,
+                          self.connection === connection else { return }
+                    self.sendFramed(framed)
+                }
             }
         }
         if submitStatus == noErr {
@@ -3716,10 +3720,11 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
 
     /// Put an encoded frame on the wire, through the latency-first queue.
     ///
-    /// Runs on `queue` (the VideoToolbox completion hops here via `encode`'s
-    /// caller), which is the only executor allowed to touch `connection` and
+    /// Runs on `queue` (the VideoToolbox completion explicitly hops here),
+    /// which is the only executor allowed to touch `connection` and
     /// therefore the only one allowed to touch the queue.
     private func sendFramed(_ payload: Data) {
+        dispatchPrecondition(condition: .onQueue(queue))
         guard let connection, videoDeliveryActive else { return }
         let frame = FrameCodec.encode(payload, type: .video,
                                       tagged: peerSpeaksTaggedFrames)
