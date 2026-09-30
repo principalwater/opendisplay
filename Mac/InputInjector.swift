@@ -429,6 +429,7 @@ final class InputInjector {
 
     private let stateLock = NSLock()
     private var modifiers = ModifierKeyState()
+    private var pointerModifierSnapshot: UInt?
     private let keyRepeat: KeyRepeatController
     /// Which Option key stands in for Command this session. Read from
     /// `commandKeyRemap` (with the legacy `remapRightOptionToCommand` boolean
@@ -480,17 +481,36 @@ final class InputInjector {
         return body()
     }
 
+    /// Mouse/gesture events cannot inherit a flagsChanged still queued in HID.
+    /// Keep source latches and event-class flags, replacing held modifiers with
+    /// the same ordered, remapped state used by the keyboard path.
+    private func postWithTrackedModifiers(_ event: CGEvent) {
+        event.flags.subtract(Self.heldModifierFlags)
+        event.flags.formUnion(modifiers.flags(reported: pointerModifierSnapshot ?? 0,
+                                             includeReported: true, commandKeyRemap: commandKeyRemap,
+                                             sticky: stickyModifiers))
+        if keyRemapPlan.claimsCapsLock { event.flags.subtract(.maskAlphaShift) }
+        sink.post(event)
+    }
+
+    private static let heldModifierFlags = KeyboardMap.HID.range.reduce(CGEventFlags()) {
+        $0.union(KeyboardMap.flags(forModifier: $1, commandKeyRemap: .none))
+    }
+
     /// Sets sticky modifier flags sent from the on-screen modifier sidebar
     /// (issue #7). State, not an event: the receiver sends the whole new set.
     func setStickyModifiers(_ rawFlags: UInt) {
         withState { stickyModifiers = Self.eventFlags(for: rawFlags) }
     }
 
-    /// Releases a modifier whose key-up was lost to iPadOS before a new touch.
+    /// Releases a modifier whose key-up was lost before a new pointer action.
     /// The snapshot is the touch event's physical keyboard state; unlike a
     /// timeout it keeps a deliberately held modifier available for a click.
     func reconcileModifiers(reported rawModifiers: UInt) {
-        withState { lockedReconcileModifiers(reported: rawModifiers) }
+        withState {
+            pointerModifierSnapshot = rawModifiers
+            lockedReconcileModifiers(reported: rawModifiers)
+        }
     }
 
     /// Shared by touch snapshots and key presses while `stateLock` is held.
@@ -531,6 +551,13 @@ final class InputInjector {
     ///   3. a held key auto-repeats (see KeyRepeat.swift).
     func handleKey(hidUsage: UInt16, down: Bool, rawModifiers: UInt? = nil, characters: String? = nil) {
         withState {
+            // Modifier transitions supersede snapshots. Ordinary releases can
+            // retain stale chord flags, just as on the keyboard path.
+            if KeyboardMap.isModifier(hidUsage) {
+                pointerModifierSnapshot = nil
+            } else if down, let rawModifiers {
+                pointerModifierSnapshot = rawModifiers
+            }
             // A key press can repair a lost modifier release before computing
             // its flags. Modifier transitions and omitted snapshots stay exact.
             if down, let rawModifiers, !KeyboardMap.isModifier(hidUsage) {
@@ -797,6 +824,7 @@ final class InputInjector {
     /// remain. Without this a disconnect with ⌘ down leaves the Mac believing
     /// ⌘ is still held, and the next real keystroke is a shortcut.
     private func lockedResetKeyboard() {
+        pointerModifierSnapshot = nil
         stopRepeat()
         // A chord whose release never arrived (disconnect mid-press) must not
         // swallow the next legitimate backtick.
@@ -885,7 +913,7 @@ final class InputInjector {
         guard let ev = CGEvent(mouseEventSource: source, mouseType: up,
                                mouseCursorPosition: point, mouseButton: held) else { return }
         ev.setIntegerValueField(.mouseEventClickState, value: 0)
-        sink.post(ev)
+        postWithTrackedModifiers(ev)
     }
 
     /// Ends Pencil contact as an interruption rather than a stroke: the normal
@@ -978,8 +1006,7 @@ final class InputInjector {
         guard let event = CGEvent(mouseEventSource: source, mouseType: type,
                                   mouseCursorPosition: point, mouseButton: btn) else { return }
         event.setIntegerValueField(.mouseEventClickState, value: Int64(clickState))
-        if !stickyModifiers.isEmpty { event.flags.insert(stickyModifiers) }
-        sink.post(event)
+        postWithTrackedModifiers(event)
     }
 
     /// Trackpad pointer hover: move the Mac's cursor without pressing anything.
@@ -1045,8 +1072,7 @@ final class InputInjector {
         }
         lastPointerPoint = point
         event.setIntegerValueField(.mouseEventClickState, value: 0)
-        if !stickyModifiers.isEmpty { event.flags.insert(stickyModifiers) }
-        sink.post(event)
+        postWithTrackedModifiers(event)
     }
 
     /// The encoded stream size currently being sent to the receiver, in pixels.
@@ -1102,7 +1128,7 @@ final class InputInjector {
             event.setIntegerValueField(.scrollWheelEventMomentumPhase,
                                        value: phase.momentumPhaseValue)
         }
-        sink.post(event)
+        postWithTrackedModifiers(event)
     }
 
     // MARK: - Zoom (pinch)
@@ -1333,8 +1359,7 @@ final class InputInjector {
         ODSetEventIntegerField(event, ODEventFieldGesturePhase, phase.rawValue)
         event.location = point
         magnifyLastPoint = point
-        if !stickyModifiers.isEmpty { event.flags.insert(stickyModifiers) }
-        sink.post(event)
+        postWithTrackedModifiers(event)
     }
 
     // MARK: Zoom — the keystroke path (the default)

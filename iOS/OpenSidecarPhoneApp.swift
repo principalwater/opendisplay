@@ -1520,6 +1520,9 @@ struct VideoLayerView: UIViewRepresentable {
         private var lastNorm: (x: Double, y: Double) = (0.5, 0.5)
 
         @objc func didTwoFingerPan(_ recognizer: UIPanGestureRecognizer) {
+            if recognizer.state == .began || recognizer.state == .changed {
+                receiver?.sendModifierSnapshot(UInt(recognizer.modifierFlags.rawValue))
+            }
             guard let video = receiver?.videoSize, video != .zero else { return }
             switch recognizer.state {
             case .began:
@@ -1619,6 +1622,9 @@ struct VideoLayerView: UIViewRepresentable {
         /// moving it per sample would retarget the scroll mid-gesture, and a
         /// real trackpad does not drag the cursor while scrolling either.
         @objc func didNativePan(_ recognizer: UIPanGestureRecognizer) {
+            if recognizer.state == .began || recognizer.state == .changed {
+                receiver?.sendModifierSnapshot(UInt(recognizer.modifierFlags.rawValue))
+            }
             trace("nativePan", recognizer)
             guard let video = receiver?.videoSize, video != .zero else { return }
             let scale = min(bounds.width / video.width, bounds.height / video.height)
@@ -2051,6 +2057,9 @@ struct VideoLayerView: UIViewRepresentable {
         /// monitor rather than a touchscreen. Sent as the additive `pointer`
         /// control message; the Mac injects a CGEvent `.mouseMoved`.
         @objc func didPointerHover(_ recognizer: UIHoverGestureRecognizer) {
+            if recognizer.state == .began || recognizer.state == .changed {
+                receiver?.sendModifierSnapshot(UInt(recognizer.modifierFlags.rawValue))
+            }
             // A click-drag is delivered as touches, not hover, and owns the
             // position while it lasts.
             guard pointerButton == nil else { return }
@@ -2225,6 +2234,9 @@ struct VideoLayerView: UIViewRepresentable {
         /// trackpad pointer already drives it continuously via hover, so the
         /// scroll lands under the cursor the user is looking at.
         @objc func didIndirectScroll(_ recognizer: UIPanGestureRecognizer) {
+            if recognizer.state == .began || recognizer.state == .changed {
+                receiver?.sendModifierSnapshot(UInt(recognizer.modifierFlags.rawValue))
+            }
             guard let video = receiver?.videoSize, video != .zero else { return }
             switch recognizer.state {
             case .began:

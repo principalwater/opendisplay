@@ -169,6 +169,52 @@ final class KeyboardInjectionTests: XCTestCase {
         XCTAssertTrue(sink.events.first?.flags.contains(.maskAlternate) ?? false)
     }
 
+    func testPointerEventsUseTrackedRemappedModifiersBeforeHIDStateCatchesUp() {
+        // Posting flagsChanged does not synchronously update hidSystemState.
+        // Click, hover and scroll must use the same ordered state as keys.
+        let actions: [(InputInjector) -> Void] = [
+            { $0.handleTouch(phase: "began", x: 0.5, y: 0.5) },
+            { $0.handlePointerMove(x: 0.5, y: 0.5) },
+            { $0.handleScroll(dx: 0, dy: 20) }
+        ]
+        // A modifier already held before the video obtained focus is known
+        // only through the fresh snapshot. Sticky flags remain independent.
+        for action in actions {
+            let injector = makeInjector(remap: .swapLeftOptionCommand, escapeKey: .controlGrave)
+            injector.setStickyModifiers(KeyboardMap.uiControl)
+            injector.reconcileModifiers(reported: KeyboardMap.uiShift | KeyboardMap.uiAlphaShift)
+            injector.handleKey(hidUsage: 0x04, down: true,
+                               rawModifiers: KeyboardMap.uiShift | KeyboardMap.uiAlphaShift)
+            injector.handleKey(hidUsage: 0x04, down: false, rawModifiers: KeyboardMap.uiAlternate)
+            sink.reset()
+            action(injector)
+            XCTAssertEqual(sink.events.last?.flags.intersection([.maskShift, .maskControl, .maskAlphaShift]),
+                           [.maskShift, .maskControl, .maskAlphaShift])
+        }
+        for (usage, raw, expected) in [
+            (KeyboardMap.HID.leftOption, KeyboardMap.uiAlternate, CGEventFlags.maskCommand),
+            (KeyboardMap.HID.leftCommand, KeyboardMap.uiCommand, CGEventFlags.maskAlternate)
+        ] {
+            for action in actions {
+                let injector = makeInjector(remap: .swapLeftOptionCommand)
+                injector.handleKey(hidUsage: usage, down: true, rawModifiers: raw)
+                sink.reset()
+                action(injector)
+                XCTAssertEqual(sink.events.last?.flags.intersection([.maskCommand, .maskAlternate]), expected)
+
+                injector.reconcileModifiers(reported: raw)
+                sink.reset()
+                action(injector)
+                XCTAssertEqual(sink.events.last?.flags.intersection([.maskCommand, .maskAlternate]), expected)
+
+                injector.reconcileModifiers(reported: 0)
+                sink.reset()
+                action(injector)
+                XCTAssertTrue(sink.events.last?.flags.intersection([.maskCommand, .maskAlternate]).isEmpty ?? false)
+            }
+        }
+    }
+
     func testStaleChordKeyUpCannotReassertAReleasedSwappedModifier() {
         // Releasing the modifier before the chord key must not restore the
         // original physical modifier from the key's stale UIKit snapshot.
