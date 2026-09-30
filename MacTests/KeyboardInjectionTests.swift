@@ -169,6 +169,40 @@ final class KeyboardInjectionTests: XCTestCase {
         XCTAssertTrue(sink.events.first?.flags.contains(.maskAlternate) ?? false)
     }
 
+    func testRemappedShiftArrowsKeepNativeNavigationFlags() {
+        // UIKit may omit the arrow's key-class flags. Overwriting CGEvent's
+        // native flags must not turn a Command+Shift arrow into a plain key.
+        let injector = makeInjector(remap: .swapLeftOptionCommand)
+        let raw = KeyboardMap.uiAlternate | KeyboardMap.uiShift
+        injector.handleKey(hidUsage: KeyboardMap.HID.leftOption, down: true,
+                           rawModifiers: KeyboardMap.uiAlternate)
+        injector.handleKey(hidUsage: KeyboardMap.HID.leftShift, down: true,
+                           rawModifiers: raw)
+        sink.reset()
+
+        let keyClass: CGEventFlags = [.maskNumericPad, .maskSecondaryFn]
+        for usage: UInt16 in [0x4F, 0x50, 0x51, 0x52] {
+            let virtualKey = KeyboardMap.macKeyCode(for: usage)!
+            let native = CGEvent(keyboardEventSource: CGEventSource(stateID: .privateState),
+                                 virtualKey: virtualKey, keyDown: true)!
+            injector.handleKey(hidUsage: usage, down: true, rawModifiers: raw)
+            injector.handleKey(hidUsage: usage, down: false, rawModifiers: raw)
+            for event in sink.events.suffix(2) {
+                XCTAssertEqual(event.flags.intersection(keyClass),
+                               native.flags.intersection(keyClass))
+                XCTAssertTrue(event.flags.contains(.maskCommand))
+                XCTAssertTrue(event.flags.contains(.maskShift))
+                XCTAssertFalse(event.flags.contains(.maskAlternate))
+            }
+        }
+
+        sink.reset()
+        injector.handleKey(hidUsage: 0x04, down: true, rawModifiers: raw)
+        injector.handleKey(hidUsage: 0x04, down: false, rawModifiers: raw)
+        XCTAssertTrue(sink.events.allSatisfy { $0.flags.intersection(keyClass).isEmpty },
+                      "letters must not inherit navigation flags")
+    }
+
     func testALostModifierKeyUpIsRepairedByTheNextKeysModifierSnapshot() {
         // swapLeftOptionCommand: physical left Option is Command, so an arrow
         // chord held as "left Option + Shift" must reach the Mac as ⌘⇧←/→. If

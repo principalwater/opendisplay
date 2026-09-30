@@ -754,7 +754,11 @@ final class InputInjector {
         // A modifier transition is a `.flagsChanged` event carrying the new
         // flag set; the keycode rides along so apps can tell left from right.
         if isModifier { event.type = .flagsChanged }
-        event.flags = flags
+        // Arrow shortcuts need the same key-class flags as native macOS
+        // arrows; UIKit's modifier snapshot need not report either flag.
+        let navigationFlags: CGEventFlags = !isModifier && (0x7B...0x7E).contains(virtualKey)
+            ? [.maskNumericPad, .maskSecondaryFn] : []
+        event.flags = flags.union(navigationFlags)
         if autorepeat { event.setIntegerValueField(.keyboardEventAutorepeat, value: 1) }
         sink.post(event)
     }

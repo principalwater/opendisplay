@@ -9,6 +9,14 @@ credentials, and development logs are not included in this branch.
 
 ## Added behavior
 
+### Sender 1.22.4
+
+Injected arrow keys keep the native macOS NumericPad and Fn key-class flags
+on both press and release. This preserves the native navigation event shape
+for remapped Command+Shift+arrow shortcuts even when UIKit reports only the
+physical modifiers. Letters and modifier transitions are unaffected. The wire
+protocol and signed 1.22.0 receiver remain compatible.
+
 ### Sender 1.22.3
 
 The encoder permits two in-flight frames and uses normal real-time rate
