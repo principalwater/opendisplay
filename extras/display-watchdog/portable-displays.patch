@@ -54,7 +54,7 @@
 +  done
 +  return 0
  }
-@@ -374,3 +386,53 @@
+@@ -374,3 +386,55 @@
  virtual_is_connected() { printf '%s' "$(virtual_connection_state || true)" | grep -q '^on'; }
 -physical_is_connected() { printf '%s' "$(physical_connection_state || true)" | grep -q '^on'; }
 +physical_is_connected() { [ -n "$(physical_display_lines)" ]; }
@@ -66,13 +66,15 @@
 +remember_physical_displays() {
 +  local id identifiers uuid candidate
 +  candidate=$(mktemp "$PHYSICAL_DISPLAY_STATE.XXXXXX") || return 1
-+  if [ -f "$PHYSICAL_DISPLAY_STATE" ]; then cat "$PHYSICAL_DISPLAY_STATE" > "$candidate"; fi
++  if [ -f "$PHYSICAL_DISPLAY_STATE" ]; then
++    cat "$PHYSICAL_DISPLAY_STATE" > "$candidate" || { /bin/unlink "$candidate"; return 1; }
++  fi
 +  while IFS=$'\t' read -r id _; do
 +    [ -n "$id" ] || continue
 +    identifiers=$("$BETTERDISPLAY" get -displayID="$id" -identifiers 2>/dev/null) || { /bin/unlink "$candidate"; return 1; }
 +    uuid=$(identifier_value "$identifiers" UUID)
 +    if ! valid_display_uuid "$uuid"; then /bin/unlink "$candidate"; return 1; fi
-+    grep -Fqx "$uuid" "$candidate" || printf '%s\n' "$uuid" >> "$candidate"
++    grep -Fqx "$uuid" "$candidate" || printf '%s\n' "$uuid" >> "$candidate" || { /bin/unlink "$candidate"; return 1; }
 +  done < <(physical_display_lines)
 +  # Persist identities before disconnecting anything, including on partial failure.
 +  /bin/mv "$candidate" "$PHYSICAL_DISPLAY_STATE"
@@ -109,16 +111,16 @@
 +  dry "$DISPLAY_LIST" --make-main "$id"
 +}
 
-@@ -409,2 +471,3 @@
+@@ -409,2 +473,3 @@
    physical_is_connected || return 1
 +  [ ! -e "$PHYSICAL_DISPLAY_STATE" ] || return 1
    ! virtual_is_connected
-@@ -444,3 +507,3 @@
+@@ -444,3 +509,3 @@
    # panel second, then drop the placeholder.
 -  if ! real_display_present; then
 +  if ! physical_is_connected && ! real_display_present; then
      note "no real display attached — connecting the placeholder before the panel"
-@@ -449,7 +512,9 @@
+@@ -449,7 +514,9 @@
    fi
 -  dry "$BETTERDISPLAY" set -name="$PHYSICAL_DISPLAY_NAME" -connected=on >/dev/null 2>&1 || return 1
 -  wait_for_connection_state "$PHYSICAL_DISPLAY_NAME" on || return 1
@@ -132,11 +134,11 @@
 +  [ ! -e "$PHYSICAL_DISPLAY_STATE" ] || /bin/unlink "$PHYSICAL_DISPLAY_STATE"
 +  return 0
  }
-@@ -514,2 +579,3 @@
+@@ -514,2 +581,3 @@
  apply_session_headed_topology() {
 +  local uuid
    ensure_betterdisplay_running || return 1
-@@ -520,4 +586,19 @@
+@@ -520,4 +588,19 @@
    if physical_is_connected; then
 -    dry "$BETTERDISPLAY" set -name="$PHYSICAL_DISPLAY_NAME" -connected=off >/dev/null 2>&1 || return 1
 -    wait_for_connection_state "$PHYSICAL_DISPLAY_NAME" off || return 1

@@ -204,6 +204,18 @@ exit "$result"
         self.assertNotEqual(self.run_topology().returncode, 0)
         self.assertFalse(any(c[0] == "set" for c in self.state["calls"]))
 
+    def test_unreadable_recovery_record_refuses_physical_disconnect(self):
+        record = self.root / "physical-displays"
+        record.write_text("00000000-0000-0000-0000-000000000099\n")
+        record.chmod(0)
+        self.state["session"] = True
+        self.state["panels"][0]["manageable"] = True
+        result = self.run_topology("headed")
+        record.chmod(0o600)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertTrue(self.state["panels"][0]["on"])
+        self.assertEqual(record.read_text(), "00000000-0000-0000-0000-000000000099\n")
+
     def test_unsupported_disconnect_leaves_physical_monitor_and_recovery_record(self):
         self.state["session"] = True
         result = self.run_topology("headed")
