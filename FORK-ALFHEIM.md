@@ -9,6 +9,15 @@ credentials, and development logs are not included in this branch.
 
 ## Added behavior
 
+### External watchdog update (2026-10-26)
+
+The optional [portable display patch](extras/display-watchdog/README.md) updates
+an already installed external watchdog. It removes physical monitor-name and mode
+hardcoding, releases stale idle display-sleep assertions on a local desktop, and
+records actual display UUIDs for remote-session restoration. The guarded updater
+preserves each Mac's private configuration and makes a rollback copy. This is a
+separate deployment update; replacing the app bundle alone does not apply it.
+
 ### Sender 1.22.4
 
 A nonmodifier key-up ignores UIKit's fallback modifier snapshot, which can
@@ -98,10 +107,10 @@ the receiver's TCP port 9000; the optional cursor and stats lane uses UDP
 the local network. A routed or tailnet deployment needs an explicit reachable
 receiver endpoint and should be validated end to end before unattended use.
 
-The external display watchdog and host-specific network configuration are
-deployment concerns and are deliberately not included in this public source
-branch. They depend on each Mac's displays, BetterDisplay identifiers, power
-policy, and network topology.
+The complete external display watchdog and host-specific network configuration
+remain private deployment concerns. The optional portable patch above contains
+only the shared physical-display repair; it does not distribute host settings or
+install a new watchdog.
 
 ## Upstream contribution context
 

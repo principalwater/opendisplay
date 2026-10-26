@@ -1,0 +1,160 @@
+--- opendisplay-watchdog
++++ opendisplay-watchdog
+@@ -94,2 +94,3 @@
+ TOPOLOGY_STATE="$LOG_DIR/opendisplay-watchdog.topology"
++PHYSICAL_DISPLAY_STATE="$LOG_DIR/opendisplay-watchdog.physical-displays"
+ SESSION_FIRST_SEEN="$LOG_DIR/opendisplay-watchdog.session-first-seen"
+@@ -171,4 +172,3 @@
+   # nothing at all is attached; it is not hardware.
+-  if display_list | /usr/bin/awk -F '\t' -v v="$DISPLAY_NAME" -v p="$OPENDISPLAY_DISPLAY_PREFIX" \
+-      '$5 != "" && $5 !~ /\(AirPlay\)/ && $5 != v && index($5, p) != 1 { found = 1 } END { exit found ? 0 : 1 }'; then
++  if physical_is_connected; then
+     return 0
+@@ -229,13 +229,2 @@
+     current=$(virtual_connection_state || true)
+-    printf '%s' "$current" | grep -q "^${expected}" && return 0
+-    sleep 1
+-  done
+-  return 1
+-}
+-
+-wait_for_connection_state() {
+-  local display_name="$1" expected="$2" current
+-  [ "$DRY_RUN" = "1" ] && return 0
+-  for _ in 1 2 3 4 5 6 7 8 9 10; do
+-    current=$("$BETTERDISPLAY" get -name="$display_name" -connected 2>/dev/null | tail -1)
+     printf '%s' "$current" | grep -q "^${expected}" && return 0
+@@ -369,4 +358,27 @@
+
+-physical_connection_state() {
+-  "$BETTERDISPLAY" get -name="$PHYSICAL_DISPLAY_NAME" -connected 2>/dev/null | tail -1
++physical_display_lines() {
++  local lines identifiers index=0 id name location uuid connected
++  lines=$(display_list | /usr/bin/awk -F '\t' -v v="$DISPLAY_NAME" -v p="$OPENDISPLAY_DISPLAY_PREFIX" '
++    $1 ~ /^[1-9][0-9]*$/ && $5 != "" && $5 != "?" && $5 !~ /\(AirPlay\)/ && $5 != v && index($5, p) != 1 {
++      if ($2 == "main") main = $0; else others = others $0 "\n"
++    }
++    END { if (main != "") print main; printf "%s", others }')
++  if [ -n "$lines" ]; then printf '%s\n' "$lines"; return 0; fi
++  # Sleeping panels disappear from CGGetActiveDisplayList. BetterDisplay retains
++  # their hardware registry identity; virtual displays have no registry location.
++  identifiers=$("$BETTERDISPLAY" get -deviceType=Display -identifiers 2>/dev/null) || return 1
++  identifiers="[$identifiers]"
++  while id=$(identifier_value "$identifiers" "$index.displayID"); do
++    location=$(identifier_value "$identifiers" "$index.registryLocation" || true)
++    name=$(identifier_value "$identifiers" "$index.name" || true)
++    uuid=$(identifier_value "$identifiers" "$index.UUID" || true)
++    if [ -n "$location" ] && [ -n "$name" ] && valid_display_uuid "$uuid" &&
++        printf '%s\n' "$id" | grep -Eq '^[1-9][0-9]*$'; then
++      connected=$("$BETTERDISPLAY" get -UUID="$uuid" -connected 2>/dev/null || true)
++      # Unsupported connection management must not hide a real Apple panel.
++      case "$connected" in off*) ;; *) printf '%s\t-\t0x0\tinactive\t%s\n' "$id" "$name" ;; esac
++    fi
++    index=$((index + 1))
++  done
++  return 0
+ }
+@@ -374,3 +386,53 @@
+ virtual_is_connected() { printf '%s' "$(virtual_connection_state || true)" | grep -q '^on'; }
+-physical_is_connected() { printf '%s' "$(physical_connection_state || true)" | grep -q '^on'; }
++physical_is_connected() { [ -n "$(physical_display_lines)" ]; }
++
++valid_display_uuid() {
++  printf '%s\n' "$1" | grep -Eq '^[0-9A-Fa-f]{8}(-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}$'
++}
++
++remember_physical_displays() {
++  local id identifiers uuid candidate
++  candidate=$(mktemp "$PHYSICAL_DISPLAY_STATE.XXXXXX") || return 1
++  if [ -f "$PHYSICAL_DISPLAY_STATE" ]; then cat "$PHYSICAL_DISPLAY_STATE" > "$candidate"; fi
++  while IFS=$'\t' read -r id _; do
++    [ -n "$id" ] || continue
++    identifiers=$("$BETTERDISPLAY" get -displayID="$id" -identifiers 2>/dev/null) || { /bin/unlink "$candidate"; return 1; }
++    uuid=$(identifier_value "$identifiers" UUID)
++    if ! valid_display_uuid "$uuid"; then /bin/unlink "$candidate"; return 1; fi
++    grep -Fqx "$uuid" "$candidate" || printf '%s\n' "$uuid" >> "$candidate"
++  done < <(physical_display_lines)
++  # Persist identities before disconnecting anything, including on partial failure.
++  /bin/mv "$candidate" "$PHYSICAL_DISPLAY_STATE"
++}
++
++physical_uuid_is_connected() {
++  local identifiers id
++  identifiers=$("$BETTERDISPLAY" get -UUID="$1" -identifiers 2>/dev/null) || return 1
++  id=$(identifier_value "$identifiers" displayID)
++  physical_display_lines | /usr/bin/awk -F '\t' -v id="$id" '$1 == id { found = 1 } END { exit found ? 0 : 1 }'
++}
++
++restore_physical_displays() {
++  local uuid first="" identifiers id
++  [ -f "$PHYSICAL_DISPLAY_STATE" ] || return 0
++  while IFS= read -r uuid; do
++    valid_display_uuid "$uuid" || return 1
++    [ -n "$first" ] || first="$uuid"
++    if ! physical_uuid_is_connected "$uuid"; then
++      dry "$BETTERDISPLAY" set -UUID="$uuid" -connected=on >/dev/null 2>&1 || return 1
++      if [ "$DRY_RUN" != 1 ]; then
++        for _ in 1 2 3 4 5 6 7 8 9 10; do
++          physical_uuid_is_connected "$uuid" && break
++          sleep 1
++        done
++        physical_uuid_is_connected "$uuid" || return 1
++      fi
++    fi
++  done < "$PHYSICAL_DISPLAY_STATE"
++  [ -n "$first" ] || return 1
++  identifiers=$("$BETTERDISPLAY" get -UUID="$first" -identifiers 2>/dev/null) || return 1
++  id=$(identifier_value "$identifiers" displayID)
++  printf '%s\n' "$id" | grep -Eq '^[1-9][0-9]*$' || return 1
++  dry "$DISPLAY_LIST" --make-main "$id"
++}
+
+@@ -409,2 +471,3 @@
+   physical_is_connected || return 1
++  [ ! -e "$PHYSICAL_DISPLAY_STATE" ] || return 1
+   ! virtual_is_connected
+@@ -444,3 +507,3 @@
+   # panel second, then drop the placeholder.
+-  if ! real_display_present; then
++  if ! physical_is_connected && ! real_display_present; then
+     note "no real display attached — connecting the placeholder before the panel"
+@@ -449,7 +512,9 @@
+   fi
+-  dry "$BETTERDISPLAY" set -name="$PHYSICAL_DISPLAY_NAME" -connected=on >/dev/null 2>&1 || return 1
+-  wait_for_connection_state "$PHYSICAL_DISPLAY_NAME" on || return 1
+-  dry "$BETTERDISPLAY" set -name="$PHYSICAL_DISPLAY_NAME" -displayModeNumber="$PHYSICAL_DISPLAY_MODE" -main=on >/dev/null 2>&1 || return 1
++  restore_physical_displays || return 1
++  physical_is_connected || return 1
++  # A usable physical desktop needs no keep-awake, even if virtual cleanup fails.
++  stop_headless_keepawake || return 1
+   disconnect_virtual || return 1
+-  stop_headless_keepawake
++  [ ! -e "$PHYSICAL_DISPLAY_STATE" ] || /bin/unlink "$PHYSICAL_DISPLAY_STATE"
++  return 0
+ }
+@@ -514,2 +579,3 @@
+ apply_session_headed_topology() {
++  local uuid
+   ensure_betterdisplay_running || return 1
+@@ -520,4 +586,19 @@
+   if physical_is_connected; then
+-    dry "$BETTERDISPLAY" set -name="$PHYSICAL_DISPLAY_NAME" -connected=off >/dev/null 2>&1 || return 1
+-    wait_for_connection_state "$PHYSICAL_DISPLAY_NAME" off || return 1
++    if [ "$DRY_RUN" = 1 ]; then
++      note "DRY-RUN: remember and disconnect current physical display UUIDs"
++      make_opendisplay_main
++      return $?
++    fi
++    remember_physical_displays || return 1
++    while IFS= read -r uuid; do
++      valid_display_uuid "$uuid" || return 1
++      dry "$BETTERDISPLAY" set -UUID="$uuid" -connected=off >/dev/null 2>&1 || return 1
++    done < "$PHYSICAL_DISPLAY_STATE"
++    if [ "$DRY_RUN" != 1 ]; then
++      for _ in 1 2 3 4 5 6 7 8 9 10; do
++        physical_is_connected || break
++        sleep 1
++      done
++      physical_is_connected && return 1
++    fi
+   fi
