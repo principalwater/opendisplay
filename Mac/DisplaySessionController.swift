@@ -19,17 +19,28 @@ final class DisplaySessionController {
   private var responses = Data()
   private var sequence: UInt64 = 0
   private var waiters: [UInt64: CheckedContinuation<Void, Never>] = [:]
+  private var restorationWaiters: [UInt64: CheckedContinuation<Void, Never>] = [:]
+  private var teardowns: [ObjectIdentifier: Task<Void, Never>] = [:]
   private var shuttingDown = false
   private var physicalControlFailed = false
   private var recoveryRestarted = false
+  private var recovering = false
 
   func start() {
-    guard process == nil, !shuttingDown else { return }
+    guard process == nil, !shuttingDown, !recovering else { return }
     do {
       guard let executable = Bundle.main.url(forAuxiliaryExecutable: "OpenDisplayDisplayAgent")
       else { throw DisplayControlError.unavailableSymbol }
-      try validateSignature(Bundle.main.bundleURL)
-      try validateSignature(executable)
+      let appInfo = try validateSignature(Bundle.main.bundleURL)
+      let agentInfo = try validateSignature(executable)
+      let identifier = Bundle.main.bundleIdentifier ?? ""
+      let base = identifier.hasSuffix(".debug") ? String(identifier.dropLast(6)) : identifier
+      let team = appInfo[kSecCodeInfoTeamIdentifier as String] as? String
+      guard agentInfo[kSecCodeInfoIdentifier as String] as? String == base + ".display-agent",
+        agentInfo[kSecCodeInfoTeamIdentifier as String] as? String == team,
+        team != nil || identifier.hasSuffix(".debug") else {
+        throw DisplayControlError.invalidIntent
+      }
       let child = Process()
       let input = Pipe()
       let output = Pipe()
@@ -75,6 +86,7 @@ final class DisplaySessionController {
           self.physicalControlFailed = true
           self.report("Display agent stopped; restoring local displays")
           await self.recoverAfterAgentExit()
+          self.finishRestorationWaiters()
         }
       }
       try child.run()
@@ -92,6 +104,7 @@ final class DisplaySessionController {
   }
 
   func prepare(session: ObjectIdentifier, remote: Bool) async {
+    for task in Array(teardowns.values) { await task.value }
     guard !shuttingDown else { return }
     if sessions.isEmpty {
       physicalControlFailed = false
@@ -124,6 +137,30 @@ final class DisplaySessionController {
     _ = send()
   }
 
+  func endAndRestore(session: ObjectIdentifier) async {
+    sessions.removeValue(forKey: session)
+    guard let submitted = send(), !sessions.values.contains(where: \.remote) else { return }
+    await withCheckedContinuation { continuation in
+      restorationWaiters[submitted] = continuation
+      Task { @MainActor [weak self] in
+        try? await Task.sleep(for: .seconds(3))
+        guard let self, let pending = self.restorationWaiters.removeValue(forKey: submitted)
+        else { return }
+        self.report("Display restoration is still pending; finishing session teardown")
+        pending.resume()
+      }
+    }
+  }
+
+  func trackTeardown(_ task: Task<Void, Never>, session: ObjectIdentifier) {
+    teardowns[session] = task
+    Task { @MainActor [weak self] in
+      await task.value
+      guard self?.teardowns[session] == task else { return }
+      self?.teardowns.removeValue(forKey: session)
+    }
+  }
+
   func captureReleased(session: ObjectIdentifier, display: UInt32) {
     guard sessions[session]?.display == display else { return }
     sessions[session]?.display = nil
@@ -148,7 +185,7 @@ final class DisplaySessionController {
     return DisplayRecoveryStore.defaultDirectory
   }
 
-  private func validateSignature(_ url: URL) throws {
+  private func validateSignature(_ url: URL) throws -> [String: Any] {
     var code: SecStaticCode?
     let create = SecStaticCodeCreateWithPath(url as CFURL, [], &code)
     guard create == errSecSuccess, let code else {
@@ -160,6 +197,13 @@ final class DisplaySessionController {
     guard result == errSecSuccess else {
       throw NSError(domain: NSOSStatusErrorDomain, code: Int(result))
     }
+    var info: CFDictionary?
+    let copied = SecCodeCopySigningInformation(code,
+      SecCSFlags(rawValue: kSecCSSigningInformation), &info)
+    guard copied == errSecSuccess, let values = info as? [String: Any] else {
+      throw NSError(domain: NSOSStatusErrorDomain, code: Int(copied))
+    }
+    return values
   }
 
   @discardableResult
@@ -199,6 +243,7 @@ final class DisplaySessionController {
           throw DisplayControlError.invalidIntent
         }
         finishWaiters(through: status.sequence)
+        if status.disabled.isEmpty { finishRestorationWaiters(through: status.sequence) }
         if let error = status.error {
           physicalControlFailed = true
           Log.info("native display control: \(error)")
@@ -223,12 +268,20 @@ final class DisplaySessionController {
     }
   }
 
+  private func finishRestorationWaiters(through sequence: UInt64 = .max) {
+    for key in restorationWaiters.keys.filter({ $0 <= sequence }) {
+      restorationWaiters.removeValue(forKey: key)?.resume()
+    }
+  }
+
   private func report(_ message: String) {
     onStatus?(message)
     Log.info(message)
   }
 
   private func recoverAfterAgentExit() async {
+    guard !recovering else { return }
+    recovering = true
     do {
       let store = DisplayRecoveryStore(directory: stateDirectory)
       try store.acquire()
@@ -238,6 +291,7 @@ final class DisplaySessionController {
         try await Task.sleep(for: .milliseconds(250 * (attempt + 1)))
       }
     } catch { report("Local display recovery pending: \(error)") }
+    recovering = false
     // One recovery-only restart also restores the headless fallback; do not repeat a crash loop.
     if process == nil, !shuttingDown, !recoveryRestarted {
       recoveryRestarted = true

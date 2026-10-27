@@ -27,7 +27,7 @@ displays usable and report the failure in the control panel. Brightness and
 gamma are never used to imitate disconnection.
 
 The same agent supplies a small native desktop when the Mac has no physical
-panel. IOPM assertions keep a remote/headless desktop awake and are released on
+panel. IOPM assertions keep streaming and headless desktops awake and are released on
 a local idle desktop, allowing the configured macOS display-sleep timeout.
 Display changes and session transitions drive the work; there is no recurring
 display-management polling timer. Existing receiver discovery and dialers handle
@@ -50,6 +50,20 @@ Apple Thunderbolt Display brightness works natively with **Control + Brightness
 Up/Down** ([Apple keyboard shortcuts](https://support.apple.com/en-ie/102650)).
 No brightness keyboard interception is included.
 
+Capture rebuilds retain physical ownership for a bounded five-second gap; an
+explicit end, shutdown or pipe EOF restores immediately. Normal teardown waits
+for a bounded restoration acknowledgement before releasing the capture display.
+Window gathering remembers display UUIDs and relative positions, so restoring
+the physical arrangement does not invalidate the saved window coordinates.
+Unavailable panels remain in the recovery journal; a usable physical desktop
+does not retain an invisible fallback screen for a disconnected second panel.
+
+If the sender hangs, its lifetime lease remains active. Quit and reopen the Mac
+app to request recovery. If both the sender and agent have been forcibly killed,
+relaunch the app to recover its journal, or reboot the Mac. An existing launchd
+supervisor can relaunch it after a crash. Recovery requires a logged-in desktop;
+lock screen, logout and sleep/wake have not been validated on every Mac.
+
 ### Receiver 1.23.0: manual connection by default
 
 The iPad receiver waits for **Connect** beside the host picker on a cold launch.
@@ -57,6 +71,11 @@ Choose the host without a deadline, then tap Connect. Settings can enable
 automatic connection with the existing immediate or 1–5 second delay. Changing
 hosts before the first connection does not start streaming. Reconnection after
 an established session retains the existing automatic behavior.
+
+A fresh Bonjour appearance immediately wakes a waiting dial. A newly discovered
+service gets one quick fresh-resolution retry, then returns to the normal
+five-second attempt deadline and one-second retry pause. Direct host endpoints
+keep their existing deadlines; there is no added permanent fast network poll.
 
 ### External watchdog update (2026-10-26)
 

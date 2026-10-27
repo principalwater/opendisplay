@@ -104,7 +104,7 @@ enum NativeDisplayIntegration {
     try require(invalidCapture.disabled.isEmpty && CGDisplayIsOnline(physicalID) != 0,
       "A physical panel was accepted as the protected virtual capture")
     var display: CGVirtualDisplay? = try virtualDisplay()
-    guard let displayID = display?.displayID else { throw DisplayControlError.configuration(-1) }
+    guard var displayID = display?.displayID else { throw DisplayControlError.configuration(-1) }
     try pinCaptureIndependently(displayID)
     let remote = try connection.request(DisplayIntent(preparing: true,
       captures: [displayID], remotes: [displayID]))
@@ -142,13 +142,32 @@ enum NativeDisplayIntegration {
     try require(disconnectedAgain,
       "A reappearing owned physical panel stayed active during the remote session")
     print("PASS reappearing physical panel is disconnected again without losing its recovery record")
+    if !crash {
+      withExtendedLifetime(display) {}
+      display = nil
+      let gap = try connection.request(DisplayIntent(preparing: true))
+      try require(!gap.disabled.isEmpty, "Capture gap immediately released physical ownership")
+      let duringGap = try snapshotOnline()
+      try require(physical.allSatisfy { !duringGap.contains($0.id) },
+        "A rebuild gap flashed a physical panel")
+      display = try virtualDisplay()
+      guard let replacement = display?.displayID else {
+        throw DisplayControlError.configuration(-1)
+      }
+      displayID = replacement
+      try pinCaptureIndependently(displayID)
+      let replaced = try connection.request(DisplayIntent(preparing: true,
+        captures: [displayID], remotes: [displayID]))
+      try require(replaced.error == nil && !replaced.disabled.isEmpty,
+        "Replacement capture did not retain remote ownership")
+      print("PASS capture replacement keeps physical panels disconnected")
+    }
     if crash {
       print("Crashing the actual capture owner; agent must restore on EOF")
       fflush(stdout)
       _ = withExtendedLifetime(display) { kill(getpid(), SIGKILL) }
     }
-    withExtendedLifetime(display) {}
-    display = nil
+    // The real sender retains its capture until physical restoration is acknowledged.
     let ended = try connection.request(DisplayIntent())
     try require(ended.disabled.isEmpty && ended.fallback == nil,
       "Session end retained physical ownership or the fallback")
@@ -156,6 +175,9 @@ enum NativeDisplayIntegration {
     let returned = try snapshotOnline()
     try require(physical.allSatisfy { returned.contains($0.id) },
       "Session end did not restore panels")
+    try require(returned.contains(displayID), "Capture was released before physical restoration")
+    withExtendedLifetime(display) {}
+    display = nil
     print("PASS session end restores panels while native agent stays idle")
     _ = try connection.request(DisplayIntent(preparing: true))
     display = try virtualDisplay()
@@ -253,6 +275,37 @@ enum NativeDisplayIntegration {
     let recovery = DisplayRecoveryStore(directory: crashedDirectory)
     try require(wait { (try? recovery.read().isEmpty) == true }, "Crash journal remains owned")
     print("PASS real parent SIGKILL recovery without shell, BetterDisplay or polling watchdog")
+    try pendingPanel(agent: arguments[2], directory: directory.appendingPathComponent("pending"))
+  }
+
+  static func pendingPanel(agent: String, directory: URL) throws {
+    let display = try virtualDisplay()
+    // A mismatched UUID proves this ID cannot authorize a change to the live virtual display.
+    do {
+      let store = DisplayRecoveryStore(directory: directory)
+      try store.acquire()
+      try store.write([PhysicalDisplay(id: display.displayID, uuid: UUID(), x: 0, y: 0, mode: 1)])
+    }
+    var before = rusage()
+    getrusage(RUSAGE_CHILDREN, &before)
+    let connection = try AgentConnection(executable: agent, directory: directory)
+    let status = try connection.request(DisplayIntent())
+    try require(!status.disabled.isEmpty && status.fallback == nil,
+      "A missing second panel created an invisible fallback on a headed desktop")
+    try connection.closeLease()
+    try require(wait { !connection.process.isRunning }, "Pending recovery did not stop within its budget")
+    try require(connection.process.terminationStatus == 1, "Unresolved journal ownership was discarded")
+    var after = rusage()
+    getrusage(RUSAGE_CHILDREN, &after)
+    func cpu(_ value: rusage) -> Double {
+      Double(value.ru_utime.tv_sec + value.ru_stime.tv_sec)
+        + Double(value.ru_utime.tv_usec + value.ru_stime.tv_usec) / 1_000_000
+    }
+    try require(cpu(after) - cpu(before) < 1.5, "Agent spun at readable EOF during recovery")
+    let pending = try DisplayRecoveryStore(directory: directory).read()
+    try require(pending.count == 1, "Pending panel recovery was lost")
+    withExtendedLifetime(display) {}
+    print("PASS pending-panel recovery keeps a headed desktop clear and does not spin at EOF")
   }
 
   static func independentSnapshot() throws {

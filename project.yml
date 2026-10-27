@@ -203,6 +203,8 @@ targets:
     sources:
       - MacTests
       - Mac/DisplayArrangement.swift
+      - Mac/DisplaySessionController.swift
+      - Mac/BonjourDialRecovery.swift
       - Mac/FrameRate.swift
       - Mac/InputInjector.swift
       - Mac/KeyboardMap.swift

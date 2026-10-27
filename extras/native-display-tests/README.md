@@ -14,7 +14,7 @@ From the repository root, after building the Release sender:
 ```sh
 xcrun swiftc -parse-as-library -O -target arm64-apple-macos14.0 \
   -import-objc-header Mac/CGVirtualDisplayPrivate.h \
-  DisplayControl/DisplayControl.swift extras/native-display-tests/Integration.swift \
+  DisplayControl/*.swift extras/native-display-tests/Integration.swift \
   -o /tmp/opendisplay-native-integration
 /tmp/opendisplay-native-integration --exercise-hardware \
   "$PWD/build/Build/Products/Release/OpenDisplay Alfheim.app/Contents/MacOS/OpenDisplayDisplayAgent"

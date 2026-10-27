@@ -513,10 +513,16 @@ final class SenderController: ObservableObject {
     private func startBrowsing() {
         // TXT records carry the receiver's install id (new receivers).
         let browser = NWBrowser(for: .bonjourWithTXTRecord(type: "_opensidecar._tcp", domain: nil), using: .tcp)
-        browser.browseResultsChangedHandler = { [weak self] results, _ in
+        browser.browseResultsChangedHandler = { [weak self] results, changes in
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.discovered = Array(results)
+                for change in changes {
+                    if case .added(let result) = change,
+                       let session = self.session(for: ConnectionTarget.wifi(result).sessionID) {
+                        session.sender.receiverServiceAppeared(at: result.endpoint)
+                    }
+                }
                 self.endSessionsWhoseServiceVanished()
                 self.autoConnect()
             }
@@ -1092,13 +1098,11 @@ final class SenderController: ObservableObject {
             session?.qualityLevel = level
         }
         sender.onDisconnected = { [weak self, weak session] in
-            // Release the desktop during an outage; the existing dialer waits for its return.
+            // Release the desktop; fresh discovery events can reconnect the receiver.
             guard let self, let session,
                   self.sessions.contains(where: { $0 === session }) else { return }
-            let target = session.target
             Log.info("device disconnected — session \(session.id) stopped")
             self.end(session)
-            if self.autoConnectEnabled { self.connect(to: target, awaitingWake: true) }
         }
         sender.onPeerSleeping = { [weak self, weak session] in
             // The device locked. Unlike a plain disconnect this is a
@@ -1185,7 +1189,6 @@ final class SenderController: ObservableObject {
                 self.end(session)
             } catch {
                 Log.info("sender failed to start: \(error)")
-                DisplaySessionController.shared.end(session: displayOwner)
                 session.status = "Failed: \(error.localizedDescription)"
                 // Free the half-built pipeline: a leaked virtual display
                 // would keep holding this device's serial, and a parked
@@ -1193,7 +1196,7 @@ final class SenderController: ObservableObject {
                 session.failed = true
                 session.audioDeliveryActive = false
                 self.updateSpeakerMute()
-                sender.stop()
+                self.stopPipeline(session)
             }
         }
     }
@@ -1225,10 +1228,16 @@ final class SenderController: ObservableObject {
     }
 
     private func end(_ session: DeviceSession) {
-        DisplaySessionController.shared.end(session: ObjectIdentifier(session))
-        session.sender.stop()
+        stopPipeline(session)
         sessions.removeAll { $0.id == session.id }
         updateSpeakerMute()   // the last session leaving un-mutes the speakers
+    }
+
+    private func stopPipeline(_ session: DeviceSession) {
+        let task = session.sender.stop {
+            await DisplaySessionController.shared.endAndRestore(session: ObjectIdentifier(session))
+        }
+        DisplaySessionController.shared.trackTeardown(task, session: ObjectIdentifier(session))
     }
 
     /// Layout/quality apply per-pipeline at construction — rebuild every session.
@@ -1236,8 +1245,7 @@ final class SenderController: ObservableObject {
         guard running else { return }
         let targets = sessions.map(\.target)
         sessions.forEach {
-            DisplaySessionController.shared.end(session: ObjectIdentifier($0))
-            $0.sender.stop()
+            stopPipeline($0)
         }
         sessions.removeAll()
         updateSpeakerMute()

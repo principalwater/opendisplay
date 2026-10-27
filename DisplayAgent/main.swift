@@ -12,6 +12,8 @@ final class DisplayAgent {
   private var baseline: [PhysicalDisplay] = []
   private var disabled: [PhysicalDisplay] = []
   private var fallback: CGVirtualDisplay?
+  private var fallbackToken: UUID?
+  private var captureGrace = RemoteCaptureGrace()
   private var assertions: [IOPMAssertionID] = []
   private var input = Data()
   private var inputSource: DispatchSourceRead?
@@ -61,6 +63,7 @@ final class DisplayAgent {
   }
 
   private func readInput() {
+    guard !stopping else { return }
     var bytes = [UInt8](repeating: 0, count: 4096)
     let count = read(STDIN_FILENO, &bytes, bytes.count)
     if count == 0 { stop(); return }
@@ -92,8 +95,8 @@ final class DisplayAgent {
         fail("Invalid display command: \(error)")
         stop()
       }
+      if stopping { return }
       input.removeSubrange(...end)
-      if stopping { break }
     }
   }
 
@@ -109,6 +112,9 @@ final class DisplayAgent {
 
   private func createFallback() throws {
     guard fallback == nil else { return }
+    guard fallbackAttempts < 12 else { throw DisplayControlError.unstableTopology }
+    let token = UUID()
+    fallbackToken = token
     let descriptor = CGVirtualDisplayDescriptor()
     descriptor.setDispatchQueue(.main)
     descriptor.name = "OpenDisplay Recovery Desktop"
@@ -119,7 +125,13 @@ final class DisplayAgent {
     descriptor.productID = 0x4F54
     descriptor.serialNum = 0x48534C53
     descriptor.terminationHandler = { [weak self] _, _ in
-      DispatchQueue.main.async { self?.schedule() }
+      DispatchQueue.main.async {
+        guard let self, self.fallbackToken == token else { return }
+        self.fallbackToken = nil
+        self.fallback = nil
+        self.fallbackAttempts += 1
+        self.schedule()
+      }
     }
     let display = CGVirtualDisplay(descriptor: descriptor)
     let settings = CGVirtualDisplaySettings()
@@ -155,7 +167,13 @@ final class DisplayAgent {
       let captures = intent.captures.filter {
         online.contains($0) && CGDisplayIsActive($0) != 0 && backend.isVirtual($0)
       }
-      let remote = !stopping && !blocked && intent.remotes.contains { captures.contains($0) }
+      let now = ProcessInfo.processInfo.systemUptime
+      let remote = captureGrace.retainRemote(
+        sessionRequested: !stopping && !blocked && intent.preparing,
+        captureActive: intent.remotes.contains { captures.contains($0) }, now: now)
+      if remote, let deadline = captureGrace.deadline {
+        schedule(after: max(deadline - now, 0.01))
+      }
       if remote {
         try createFallback()
         guard let fallback, CGDisplayIsActive(fallback.displayID) != 0 else {
@@ -204,7 +222,8 @@ final class DisplayAgent {
           if !disabled.isEmpty { schedule(after: Double(restoreAttempts) * 0.5) }
         }
         let headed = try backend.online().contains { backend.physical($0) != nil }
-        if headed, disabled.isEmpty {
+        if headed {
+          fallbackToken = nil
           fallback = nil
         } else if !stopping {
           try createFallback()
@@ -226,6 +245,7 @@ final class DisplayAgent {
       if !disabled.isEmpty, restoreAttempts < 4 { schedule(after: 0.5); return }
       try? keepAwake(false)
       // The fallback is retained until restoration has completed or its bounded retry ends.
+      fallbackToken = nil
       fallback = nil
       exit(disabled.isEmpty ? 0 : 1)
     }
@@ -234,6 +254,11 @@ final class DisplayAgent {
   private func stop() {
     guard !stopping else { return }
     stopping = true
+    inputSource?.cancel()
+    inputSource = nil
+    input.removeAll()
+    work?.cancel()
+    work = nil
     restoreAttempts = 0
     reconcile()
   }

@@ -189,6 +189,10 @@ enum WindowGatherPolicy {
         if failed > 0 { line += "; \(failed) would not move" }
         return line
     }
+
+    static func origin(offset: CGPoint, on display: CGRect) -> CGPoint {
+        CGPoint(x: display.minX + offset.x, y: display.minY + offset.y)
+    }
 }
 
 // MARK: - The Accessibility side
@@ -196,6 +200,7 @@ enum WindowGatherPolicy {
 #if canImport(AppKit)
 import AppKit
 import ApplicationServices
+import os
 
 /// Moves other applications' windows onto the session display, and puts them
 /// back afterwards.
@@ -211,6 +216,10 @@ final class WindowGatherer {
         let window: AXUIElement
         let app: String
         let originalOrigin: CGPoint
+        let sourceUUID: CFUUID?
+        let sourceOffset: CGPoint
+        let targetUUID: CFUUID?
+        let placedOffset: CGPoint
         let placedAt: CGPoint
     }
 
@@ -218,6 +227,9 @@ final class WindowGatherer {
     /// `queue` only.
     private var moved: [Moved] = []
     private var gathering = false
+    private let gatherCancelled = OSAllocatedUnfairLock(initialState: false)
+
+    func cancelGathering() { gatherCancelled.withLock { $0 = true } }
 
     /// How long one Accessibility call may take before it is abandoned.
     ///
@@ -250,37 +262,50 @@ final class WindowGatherer {
                 Log.info("gather windows: the session display has no bounds yet — nothing done")
                 return
             }
-            self.walk(target: target, menuBarInset: menuBarInset,
-                      otherDisplays: Array(others.values), apps: apps)
+            self.walk(target: target, targetID: displayID, menuBarInset: menuBarInset,
+                      otherDisplays: others, apps: apps)
         }
     }
 
-    private func walk(target: CGRect, menuBarInset: CGFloat,
-                      otherDisplays: [CGRect], apps: [(pid: pid_t, name: String)]) {
+    private func walk(target: CGRect, targetID: CGDirectDisplayID, menuBarInset: CGFloat,
+                      otherDisplays: [CGDirectDisplayID: CGRect], apps: [(pid: pid_t, name: String)]) {
         var movedCount = 0
         var failed = 0
         var skipped: [WindowGatherPolicy.Skip: Int] = [:]
         var appsTouched = Set<String>()
 
         for app in apps {
+            guard !gatherCancelled.withLock({ $0 }) else { return }
             let element = AXUIElementCreateApplication(app.pid)
             AXUIElementSetMessagingTimeout(element, Self.messagingTimeout)
             guard let windows = Self.windows(of: element) else { continue }
             for window in windows {
+                guard !gatherCancelled.withLock({ $0 }) else { return }
                 guard let facts = Self.facts(of: window) else { continue }
                 if let reason = WindowGatherPolicy.skipReason(facts, target: target) {
                     skipped[reason, default: 0] += 1
                     continue
                 }
-                let source = otherDisplays.first { $0.contains(facts.frame.origin) } ?? .zero
+                let sourceDisplay = otherDisplays.first { $0.value.contains(facts.frame.origin) }
+                let source = sourceDisplay?.value ?? .zero
                 let destination = WindowGatherPolicy.destination(
                     for: facts.frame, from: source, to: target, menuBarInset: menuBarInset)
+                guard !gatherCancelled.withLock({ $0 }) else { return }
                 guard Self.setOrigin(destination, of: window) else {
                     failed += 1
                     continue
                 }
                 moved.append(Moved(window: window, app: app.name,
                                    originalOrigin: facts.frame.origin,
+                                   sourceUUID: sourceDisplay.flatMap {
+                                       CGDisplayCreateUUIDFromDisplayID($0.key)?.takeRetainedValue()
+                                   },
+                                   sourceOffset: CGPoint(x: facts.frame.minX - source.minX,
+                                                         y: facts.frame.minY - source.minY),
+                                   targetUUID: CGDisplayCreateUUIDFromDisplayID(targetID)?
+                                       .takeRetainedValue(),
+                                   placedOffset: CGPoint(x: destination.x - target.minX,
+                                                         y: destination.y - target.minY),
                                    placedAt: destination))
                 movedCount += 1
                 appsTouched.insert(app.name)
@@ -295,37 +320,46 @@ final class WindowGatherer {
     /// Best effort by construction: a window that has since been closed, an
     /// application that has quit, a window the user moved themselves — all are
     /// skipped, and the counts say how many of each.
-    func restore(completion: (() -> Void)? = nil) {
+    func restore(deadline: TimeInterval? = nil, completion: (() -> Void)? = nil) {
         queue.async { [weak self] in
             guard let self else { return }
             defer { completion?() }
             let all = self.moved
             self.moved.removeAll()
             guard !all.isEmpty else { return }
-            // **Read everything first, then move anything.**
-            //
-            // The caller is `MacSender.stop()`, which releases the virtual
-            // display a few instructions later. Once that display goes, macOS
-            // relocates every window that was on it — which is the very
-            // behaviour §46 opens by describing, and here it is the enemy: a
-            // window the window server has just moved is no longer "where we
-            // left it", so a read/write/read/write walk would decide, correctly
-            // but uselessly, that the user had moved the later half of the
-            // list. Doing all the reads in one tight pass takes a millisecond
-            // or so for a whole desktop, which is comfortably ahead of the
-            // display teardown, and nothing in it blocks the caller.
-            let seen = all.map { ($0, Self.facts(of: $0.window)?.frame.origin) }
+            // Snapshot before moving anything; capture remains alive through this bounded walk.
+            var seen: [(Moved, CGPoint?)] = []
+            for entry in all {
+                if let deadline, ProcessInfo.processInfo.systemUptime >= deadline { break }
+                seen.append((entry, Self.facts(of: entry.window)?.frame.origin))
+            }
             var restored = 0
             var gone = 0
             var userMoved = 0
             for (entry, origin) in seen {
+                if let deadline, ProcessInfo.processInfo.systemUptime >= deadline { break }
                 guard let origin else { gone += 1; continue }
+                var expected = entry.placedAt
+                if let uuid = entry.targetUUID {
+                    let id = CGDisplayGetDisplayIDFromUUID(uuid)
+                    if id != 0, CGDisplayIsOnline(id) != 0 {
+                        expected = WindowGatherPolicy.origin(offset: entry.placedOffset,
+                                                            on: CGDisplayBounds(id))
+                    }
+                }
                 guard WindowGatherPolicy.shouldRestore(current: origin,
-                                                       weLeftItAt: entry.placedAt) else {
+                                                       weLeftItAt: expected) else {
                     userMoved += 1
                     continue
                 }
-                if Self.setOrigin(entry.originalOrigin, of: entry.window) {
+                var destination = entry.originalOrigin
+                if let uuid = entry.sourceUUID {
+                    let id = CGDisplayGetDisplayIDFromUUID(uuid)
+                    guard id != 0, CGDisplayIsOnline(id) != 0 else { gone += 1; continue }
+                    let frame = CGDisplayBounds(id)
+                    destination = WindowGatherPolicy.origin(offset: entry.sourceOffset, on: frame)
+                }
+                if Self.setOrigin(destination, of: entry.window) {
                     restored += 1
                 } else {
                     gone += 1
@@ -334,6 +368,22 @@ final class WindowGatherer {
             Log.info("gather windows: session over — put \(restored) window(s) back"
                      + (userMoved > 0 ? ", left \(userMoved) the user had moved since" : "")
                      + (gone > 0 ? ", \(gone) no longer exist" : ""))
+        }
+    }
+
+    /// A stalled Accessibility client must not retain the capture display indefinitely.
+    func restoreBounded() async {
+        await withCheckedContinuation { continuation in
+            let pending = OSAllocatedUnfairLock(initialState:
+                Optional<CheckedContinuation<Void, Never>>(continuation))
+            let finish: @Sendable () -> Void = {
+                pending.withLock { value in
+                    value?.resume()
+                    value = nil
+                }
+            }
+            restore(deadline: ProcessInfo.processInfo.systemUptime + 2, completion: finish)
+            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 3, execute: finish)
         }
     }
 

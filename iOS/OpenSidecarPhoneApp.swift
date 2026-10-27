@@ -304,11 +304,12 @@ struct IdleView: View {
         HStack(spacing: 12) {
             ConnectToMenu(receiver: receiver)
             Button(action: onConnect) {
-                Text("Connect").frame(minHeight: 44)
+                Text(choosingInitialMac ? "Connect" : "Retry").frame(minHeight: 44)
             }
                 .buttonStyle(.borderedProminent)
                 .fixedSize(horizontal: true, vertical: false)
-                .accessibilityHint("Start connecting to the selected Mac")
+                .accessibilityHint(choosingInitialMac
+                    ? "Start connecting to the selected Mac" : "Check the receiver connection")
         }
         .frame(minHeight: 44)
     }
@@ -598,7 +599,7 @@ struct SettingsView: View {
                 }
 
                 Section {
-                    Label("USB: plug in the cable, run the Mac app — it connects automatically through the wire (lowest latency).",
+                    Label("USB: plug in the cable, run the Mac app, then tap Connect (lowest latency).",
                           systemImage: "cable.connector")
                     Label("WiFi: both devices on the same network, then pick this \(deviceKind) in the Mac app's Connection menu.",
                           systemImage: "wifi")

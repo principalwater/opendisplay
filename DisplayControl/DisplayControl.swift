@@ -127,21 +127,22 @@ final class NativeDisplayBackend {
   private typealias SetEnabled =
     @convention(c) (CGDisplayConfigRef?, UInt32, Bool) -> Int32
   private typealias CopyInfo = @convention(c) (UInt32) -> Unmanaged<CFDictionary>?
-  private let setEnabled: SetEnabled
+  private let setEnabled: SetEnabled?
   private let copyInfo: CopyInfo
 
   init() throws {
-    guard let sky = dlopen("/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight",
-      RTLD_LAZY | RTLD_LOCAL),
-      let core = dlopen("/System/Library/Frameworks/CoreDisplay.framework/CoreDisplay",
+    let sky = dlopen("/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight",
+      RTLD_LAZY | RTLD_LOCAL)
+    guard let core = dlopen("/System/Library/Frameworks/CoreDisplay.framework/CoreDisplay",
         RTLD_LAZY | RTLD_LOCAL),
-      let enabled = dlsym(sky, "CGSConfigureDisplayEnabled")
-        ?? dlsym(sky, "SLSConfigureDisplayEnabled"),
       let info = dlsym(core, "CoreDisplay_DisplayCreateInfoDictionary") else {
       throw DisplayControlError.unavailableSymbol
     }
     // These handles intentionally live as long as their function pointers (the process).
-    setEnabled = unsafeBitCast(enabled, to: SetEnabled.self)
+    let enabled = sky.flatMap {
+      dlsym($0, "CGSConfigureDisplayEnabled") ?? dlsym($0, "SLSConfigureDisplayEnabled")
+    }
+    setEnabled = enabled.map { unsafeBitCast($0, to: SetEnabled.self) }
     copyInfo = unsafeBitCast(info, to: CopyInfo.self)
   }
 
@@ -182,6 +183,7 @@ final class NativeDisplayBackend {
 
   func change(_ displays: [PhysicalDisplay], enabled: Bool) throws {
     guard !displays.isEmpty else { return }
+    guard let setEnabled else { throw DisplayControlError.unavailableSymbol }
     var config: CGDisplayConfigRef?
     let begin = CGBeginDisplayConfiguration(&config)
     guard begin == .success, let config else {
@@ -226,9 +228,11 @@ final class NativeDisplayBackend {
         if failure != .success { break }
       }
     }
-    // Keep temporary virtual desktops out of the restored physical arrangement.
-    var x = restored.map { CGFloat($0.x) + CGDisplayBounds($0.id).width }.max() ?? 0
-    for id in online where isVirtual(id) && !restored.contains(where: { $0.id == id }) {
+    let physicalBounds = online.filter { physical($0) != nil }.map { CGDisplayBounds($0) }
+    // Leave unrelated virtual desktops alone unless they overlap the restored panels.
+    var x = physicalBounds.map(\.maxX).max() ?? 0
+    for id in online where isVirtual(id)
+      && physicalBounds.contains(where: { $0.intersects(CGDisplayBounds(id)) }) {
       guard failure == .success else { break }
       guard let origin = Int32(exactly: x) else {
         failure = .rangeCheck
@@ -264,8 +268,11 @@ final class NativeDisplayBackend {
         pending.append(display)
       }
     }
-    try restoreLayout(restored)
     try store.write(pending)
+    do { try restoreLayout(restored) } catch {
+      // Connection recovery is complete even if a concurrent layout change wins the race.
+      fputs("Physical panels restored; layout recovery was best effort: \(error)\n", stderr)
+    }
     return pending
   }
 }

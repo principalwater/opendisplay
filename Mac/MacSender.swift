@@ -131,6 +131,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     @MainActor var onDisplayIdentityBumped: ((UInt32) -> Void)?
 
     private var stream: SCStream?
+    private var stopTask: Task<Void, Never>?
     private var encoder: VTCompressionSession?
     private var connection: NWConnection?
     private var virtualDisplay: VirtualDisplay?
@@ -1302,12 +1303,12 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         await status("\(mode == .extend ? "Extending to" : "Mirroring to") \(kind) (\(pixelsWide)×\(pixelsHigh))")
     }
 
-    func stop() {
+    @discardableResult
+    func stop(beforeDisplayRelease: (@MainActor () async -> Void)? = nil) -> Task<Void, Never> {
+        if let stopTask { return stopTask }
         stopped = true
-        // Before the display goes: put the gathered windows back where they
-        // were. Best effort, on its own queue, and nothing here waits for it —
-        // a window that will not move must not delay tearing a session down.
-        if windowsGathered { windowGatherer.restore() }
+        windowGatherer.cancelGathering()
+        virtualDisplay?.beginReconfiguration()
         inputInjector?.reset()
         invalidateCapturePipeline(discardingLastFrame: true)
         cursorTimer?.cancel()
@@ -1331,7 +1332,6 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         }
         if let encoder { VTCompressionSessionInvalidate(encoder) }
         encoder = nil
-        releaseVirtualDisplay("session stopped")
         cancelDropReplayTimer()
         queue.async { [weak self] in
             // Unblock a start() that is still waiting for the hello.
@@ -1340,6 +1340,13 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             self?.admissionContinuation?.resume(throwing: CancellationError())
             self?.admissionContinuation = nil
         }
+        let task = Task { @MainActor in
+            await beforeDisplayRelease?()
+            if self.windowsGathered { await self.windowGatherer.restoreBounded() }
+            self.releaseVirtualDisplay("session stopped")
+        }
+        stopTask = task
+        return task
     }
 
     /// Migrate the live session to another transport: swap the socket under
@@ -1590,6 +1597,18 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     // Guards against a stale async USB dial adopting after a newer one (or a
     // manual reconnect) superseded it. Only touched on `queue`.
     private var dialGeneration = 0
+    private var bonjourDialRecovery = BonjourDialRecovery()
+
+    /// A fresh Bonjour appearance supersedes a stale resolver or a sleeping redial.
+    func receiverServiceAppeared(at endpoint: NWEndpoint) {
+        queue.async { [weak self] in
+            guard let self, !self.stopped, !self.connectionReady,
+                  case .tcp = self.transport else { return }
+            self.transport = .tcp(endpoint)
+            self.bonjourDialRecovery = BonjourDialRecovery()
+            self.scheduleReconnect(delay: 0)
+        }
+    }
 
     private func connect() {
         guard !stopped else { return }
@@ -1900,7 +1919,6 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 
     private func connectTCP(_ endpoint: NWEndpoint) {
-        Log.info("TCP dial starting: \(endpoint)")
         let options = NWProtocolTCP.Options()
         options.noDelay = true   // latency matters more than throughput here
         // No interface steering: macOS already ranks a Thunderbolt Bridge or
@@ -1911,6 +1929,9 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         let params = NWParameters(tls: nil, tcp: options)
         let conn = NWConnection(to: endpoint, using: params)
         connection = conn
+        let isService: Bool
+        if case .service = endpoint { isService = true } else { isService = false }
+        let attempt = bonjourDialRecovery.nextAttempt(isService: isService)
         // A dial to a withdrawn Bonjour service (receiver asleep or app
         // closed) sits in .preparing forever — it neither fails nor resolves
         // when the service later returns, observed on macOS 26. Give every
@@ -1918,7 +1939,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         // Bonjour resolution, so the retry loop reaches the receiver the
         // moment it advertises again.
         let generation = dialGeneration
-        queue.asyncAfter(deadline: .now() + 5.0) { [weak self] in
+        queue.asyncAfter(deadline: .now() + attempt.timeout) { [weak self] in
             guard let self, generation == self.dialGeneration, !self.stopped,
                   self.connection === conn, conn.state != .ready else { return }
             switch self.dialTimeoutLog.note("\(conn.state)",
@@ -1931,7 +1952,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             case .quiet:
                 break
             }
-            self.scheduleReconnect()
+            self.scheduleReconnect(delay: attempt.retry)
         }
         conn.stateUpdateHandler = { [weak self] state in
             guard let self, self.connection === conn else { return }
@@ -2047,7 +2068,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         }
     }
 
-    private func scheduleReconnect() {
+    private func scheduleReconnect(delay: TimeInterval = 1) {
         guard !stopped else { return }
         // Before anything else, and before the grace timer gets a vote: the
         // link that was carrying input is gone, so nothing may still be held
@@ -2071,11 +2092,12 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         currentPathDirectLink = false
         dialGeneration += 1   // a USB dial still in flight must not adopt
         let generation = dialGeneration
+        connection?.stateUpdateHandler = nil
         connection?.cancel()
         connection = nil
         closeCursorChannel()   // rebuilt from the next hello
         resetSendQueue()
-        queue.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+        queue.asyncAfter(deadline: .now() + delay) { [weak self] in
             // Generation-guarded so a switchTransport (or another reconnect)
             // that landed in this 1s window supersedes this dial instead of
             // racing it — otherwise the queued connect() re-dials the new
