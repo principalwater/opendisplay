@@ -19,6 +19,8 @@ final class DisplayAgent {
   private var inputSource: DispatchSourceRead?
   private var signalSources: [DispatchSourceSignal] = []
   private var work: DispatchWorkItem?
+  private var workDeadline: TimeInterval?
+  private var workGeneration: UInt64 = 0
   private var restoreAttempts = 0
   private var fallbackAttempts = 0
   private var blocked = false
@@ -101,12 +103,19 @@ final class DisplayAgent {
   }
 
   private func schedule(after delay: TimeInterval = 0.15) {
-    guard work == nil else { return }
+    let deadline = ProcessInfo.processInfo.systemUptime + delay
+    if let pending = workDeadline, pending <= deadline { return }
+    work?.cancel()
+    workGeneration += 1
+    let generation = workGeneration
     let next = DispatchWorkItem { [weak self] in
-      self?.work = nil
-      self?.reconcile()
+      guard let self, self.workGeneration == generation else { return }
+      self.work = nil
+      self.workDeadline = nil
+      self.reconcile()
     }
     work = next
+    workDeadline = deadline
     DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: next)
   }
 
@@ -259,6 +268,8 @@ final class DisplayAgent {
     input.removeAll()
     work?.cancel()
     work = nil
+    workDeadline = nil
+    workGeneration += 1
     restoreAttempts = 0
     reconcile()
   }

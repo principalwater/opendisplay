@@ -218,17 +218,25 @@ final class NativeDisplayBackend {
       throw DisplayControlError.configuration(-1)
     }
     var failure: CGError = .success
+    var sizes: [UInt32: CGSize] = [:]
     for display in restored {
       failure = CGConfigureDisplayOrigin(config, display.id, display.x, display.y)
       if failure != .success { break }
       if let modes = CGDisplayCopyAllDisplayModes(display.id, nil) as? [CGDisplayMode],
-        let mode = modes.first(where: { $0.ioDisplayModeID == display.mode }),
-        CGDisplayCopyDisplayMode(display.id)?.ioDisplayModeID != mode.ioDisplayModeID {
-        failure = CGConfigureDisplayWithDisplayMode(config, display.id, mode, nil)
-        if failure != .success { break }
+        let mode = modes.first(where: { $0.ioDisplayModeID == display.mode }) {
+        sizes[display.id] = CGSize(width: mode.width, height: mode.height)
+        if CGDisplayCopyDisplayMode(display.id)?.ioDisplayModeID != mode.ioDisplayModeID {
+          failure = CGConfigureDisplayWithDisplayMode(config, display.id, mode, nil)
+          if failure != .success { break }
+        }
       }
     }
-    let physicalBounds = online.filter { physical($0) != nil }.map { CGDisplayBounds($0) }
+    let current = Dictionary(uniqueKeysWithValues: online.filter { physical($0) != nil }.map {
+      var bounds = CGDisplayBounds($0)
+      if let size = sizes[$0] { bounds.size = size }
+      return ($0, bounds)
+    })
+    let physicalBounds = Self.restorationBounds(current: current, restoring: restored)
     // Leave unrelated virtual desktops alone unless they overlap the restored panels.
     var x = physicalBounds.map(\.maxX).max() ?? 0
     for id in online where isVirtual(id)
@@ -248,6 +256,14 @@ final class NativeDisplayBackend {
     // The sender pins its capture display for the session; restore that session baseline too.
     let result = CGCompleteDisplayConfiguration(config, .forSession)
     guard result == .success else { throw DisplayControlError.configuration(result.rawValue) }
+  }
+
+  static func restorationBounds(current: [UInt32: CGRect], restoring: [PhysicalDisplay]) -> [CGRect] {
+    current.map { id, bounds in
+      guard let saved = restoring.first(where: { $0.id == id }) else { return bounds }
+      return CGRect(x: CGFloat(saved.x), y: CGFloat(saved.y),
+        width: bounds.width, height: bounds.height)
+    }
   }
 
   /// Safe both at agent startup and after a child crash; the journal precedes every off.

@@ -1606,6 +1606,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                   case .tcp = self.transport else { return }
             self.transport = .tcp(endpoint)
             self.bonjourDialRecovery = BonjourDialRecovery()
+            self.disconnectedSince = nil
             self.scheduleReconnect(delay: 0)
         }
     }

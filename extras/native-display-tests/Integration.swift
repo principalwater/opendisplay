@@ -58,8 +58,8 @@ enum NativeDisplayIntegration {
     guard condition() else { throw NSError(domain: message, code: 1) }
   }
 
-  static func wait(_ condition: () -> Bool) -> Bool {
-    let deadline = Date().addingTimeInterval(8)
+  static func wait(timeout: TimeInterval = 8, _ condition: () -> Bool) -> Bool {
+    let deadline = Date().addingTimeInterval(timeout)
     while Date() < deadline {
       if condition() { return true }
       RunLoop.main.run(until: Date().addingTimeInterval(0.05))
@@ -150,6 +150,16 @@ enum NativeDisplayIntegration {
       let duringGap = try snapshotOnline()
       try require(physical.allSatisfy { !duringGap.contains($0.id) },
         "A rebuild gap flashed a physical panel")
+      let returning = Process()
+      returning.executableURL = URL(fileURLWithPath: CommandLine.arguments[0])
+      returning.arguments = ["--reactivate", directory.path]
+      try returning.run()
+      returning.waitUntilExit()
+      try require(returning.terminationStatus == 0, "Gap reactivation failed")
+      try require(wait(timeout: 1.5) {
+        guard let observed = try? snapshotOnline() else { return false }
+        return physical.allSatisfy { !observed.contains($0.id) }
+      }, "The grace-deadline work swallowed an earlier display-change reconciliation")
       display = try virtualDisplay()
       guard let replacement = display?.displayID else {
         throw DisplayControlError.configuration(-1)

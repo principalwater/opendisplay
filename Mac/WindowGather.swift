@@ -287,19 +287,21 @@ final class WindowGatherer {
                     continue
                 }
                 let sourceDisplay = otherDisplays.first { $0.value.contains(facts.frame.origin) }
-                let source = sourceDisplay?.value ?? .zero
+                // macOS owns migration from an already disconnected screen; do not invent its source.
+                guard let sourceDisplay, CGDisplayIsOnline(sourceDisplay.key) != 0 else { continue }
+                let source = sourceDisplay.value
                 let destination = WindowGatherPolicy.destination(
                     for: facts.frame, from: source, to: target, menuBarInset: menuBarInset)
                 guard !gatherCancelled.withLock({ $0 }) else { return }
+                guard CGDisplayIsOnline(sourceDisplay.key) != 0 else { continue }
                 guard Self.setOrigin(destination, of: window) else {
                     failed += 1
                     continue
                 }
                 moved.append(Moved(window: window, app: app.name,
                                    originalOrigin: facts.frame.origin,
-                                   sourceUUID: sourceDisplay.flatMap {
-                                       CGDisplayCreateUUIDFromDisplayID($0.key)?.takeRetainedValue()
-                                   },
+                                   sourceUUID: CGDisplayCreateUUIDFromDisplayID(sourceDisplay.key)?
+                                       .takeRetainedValue(),
                                    sourceOffset: CGPoint(x: facts.frame.minX - source.minX,
                                                          y: facts.frame.minY - source.minY),
                                    targetUUID: CGDisplayCreateUUIDFromDisplayID(targetID)?

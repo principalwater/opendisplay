@@ -6,8 +6,9 @@ It never changes actual displays.
 
 The separate hardware check deliberately disconnects physical panels, reconnects
 them and SIGKILLs an actual virtual-display owner. Run it only in a local GUI
-session with a working physical display and another way to reach the Mac. Stop
-any older external display watchdog before testing. BetterDisplay is unnecessary.
+session with a working physical display and another way to reach the Mac. Quit
+the native sender and stop any external display watchdog before testing, so
+only the fixture owns display management. BetterDisplay is unnecessary.
 
 From the repository root, after building the Release sender:
 
@@ -48,7 +49,7 @@ On Apple Silicon, macOS27.0.1 and an Apple Thunderbolt Display, the hardware
 fixture passed physical disconnect, external reactivation, capture replacement
 without panel wake, repeated sessions, held-capture restoration acknowledgement,
 normal end, lease EOF and an actual capture-owner SIGKILL, restoring physical
-mode and arrangement. BetterDisplay was closed. The normal suite passed844
+mode and arrangement. BetterDisplay was closed. The normal suite passed845
 XCTest cases (one existing optional skip) and four Swift Testing cases; the
 legacy topology/updater suite passed18 cases. Signed Release builds succeeded
 for a universal macOS14+ sender/helper and the iOS16.4+ receiver. Existing
@@ -67,3 +68,9 @@ less than1.5seconds of child CPU while waiting through bounded EOF recovery.
 Physical cable hotplug and sleep/wake still require device acceptance. Intel runtime
 and other monitor hardware have not been exercised. These observations do not
 establish sustained streaming or energy performance.
+
+Final14 also verifies that a display-change event during a capture gap runs
+before the five-second grace deadline. Saved-position geometry covers a
+restored main panel and an unrelated panel with negative coordinates. The real
+multi-panel/hung-app/network-conditioning matrices remain unverified. Only one
+native or external display-management owner should run in a login session.

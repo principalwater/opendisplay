@@ -138,8 +138,10 @@ final class DisplaySessionController {
   }
 
   func endAndRestore(session: ObjectIdentifier) async {
-    sessions.removeValue(forKey: session)
-    guard let submitted = send(), !sessions.values.contains(where: \.remote) else { return }
+    let removed = sessions.removeValue(forKey: session)
+    let submitted = send()
+    guard removed?.remote == true, let submitted,
+      !sessions.values.contains(where: \.remote) else { return }
     await withCheckedContinuation { continuation in
       restorationWaiters[submitted] = continuation
       Task { @MainActor [weak self] in
