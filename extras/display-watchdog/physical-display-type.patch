@@ -1,0 +1,32 @@
+--- opendisplay-watchdog
++++ opendisplay-watchdog
+@@ -376,3 +376,3 @@
+         printf '%s\n' "$id" | grep -Eq '^[1-9][0-9]*$'; then
+-      connected=$("$BETTERDISPLAY" get -UUID="$uuid" -connected 2>/dev/null || true)
++      connected=$("$BETTERDISPLAY" get -deviceType=Display -UUID="$uuid" -connected 2>/dev/null || true)
+       # Unsupported connection management must not hide a real Apple panel.
+@@ -400,3 +400,3 @@
+     [ -n "$id" ] || continue
+-    identifiers=$("$BETTERDISPLAY" get -displayID="$id" -identifiers 2>/dev/null) || { /bin/unlink "$candidate"; return 1; }
++    identifiers=$("$BETTERDISPLAY" get -deviceType=Display -displayID="$id" -identifiers 2>/dev/null) || { /bin/unlink "$candidate"; return 1; }
+     uuid=$(identifier_value "$identifiers" UUID)
+@@ -411,3 +411,3 @@
+   local identifiers id
+-  identifiers=$("$BETTERDISPLAY" get -UUID="$1" -identifiers 2>/dev/null) || return 1
++  identifiers=$("$BETTERDISPLAY" get -deviceType=Display -UUID="$1" -identifiers 2>/dev/null) || return 1
+   id=$(identifier_value "$identifiers" displayID)
+@@ -423,3 +423,3 @@
+     if ! physical_uuid_is_connected "$uuid"; then
+-      dry "$BETTERDISPLAY" set -UUID="$uuid" -connected=on >/dev/null 2>&1 || return 1
++      dry "$BETTERDISPLAY" set -deviceType=Display -UUID="$uuid" -connected=on >/dev/null 2>&1 || return 1
+       if [ "$DRY_RUN" != 1 ]; then
+@@ -434,3 +434,3 @@
+   [ -n "$first" ] || return 1
+-  identifiers=$("$BETTERDISPLAY" get -UUID="$first" -identifiers 2>/dev/null) || return 1
++  identifiers=$("$BETTERDISPLAY" get -deviceType=Display -UUID="$first" -identifiers 2>/dev/null) || return 1
+   id=$(identifier_value "$identifiers" displayID)
+@@ -596,3 +596,3 @@
+       valid_display_uuid "$uuid" || return 1
+-      dry "$BETTERDISPLAY" set -UUID="$uuid" -connected=off >/dev/null 2>&1 || return 1
++      dry "$BETTERDISPLAY" set -deviceType=Display -UUID="$uuid" -connected=off >/dev/null 2>&1 || return 1
+     done < "$PHYSICAL_DISPLAY_STATE"

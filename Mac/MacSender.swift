@@ -150,6 +150,12 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         guard let vd = virtualDisplay else { return }
         virtualDisplay = nil
         vd.onLost = nil
+        let releasedID = vd.displayID
+        let releasedGeneration = captureGenerationNow
+        Task { @MainActor in
+            guard self.captureGenerationNow == releasedGeneration else { return }
+            self.onDisplayReady?(releasedID, false)
+        }
         Log.info("releasing virtual display \(vd.displayID): \(reason)")
         vd.release()
     }
@@ -249,6 +255,8 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     /// suppressing the LAN dial of the same iPad. `SessionDedupe` now asks, so
     /// somebody has to answer.
     @MainActor var onConnectedChange: ((Bool) -> Void)?
+    @MainActor var onDisplayPreparing: (@MainActor () async -> Void)?
+    @MainActor var onDisplayReady: ((UInt32, Bool) -> Void)?
     /// Fired when this sender can actually put audio frames on the wire.
     ///
     /// This deliberately differs from `onConnectedChange`: a persistent
@@ -736,6 +744,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                     + "another session already serves receiver \(info.id ?? "(unidentified)")")
                 throw SessionSuperseded()
             }
+            await onDisplayPreparing?()
             if stopped { return }
             try await setupExtend(info)
 
@@ -1246,6 +1255,11 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             throw error
         }
         captureDisplayID = display.displayID
+        let readyDisplayID = display.displayID
+        Task { @MainActor in
+            guard !self.stopped, self.captureGenerationNow == generation else { return }
+            self.onDisplayReady?(readyDisplayID, true)
+        }
         lastConfiguredCaptureFps = deliveredFrameCap ?? targetFPS
         lastCursorPNGHash = 0      // rotation rebuilds: re-send the sprite
         lastCursorSent = (-1, -1, false)
@@ -1886,6 +1900,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 
     private func connectTCP(_ endpoint: NWEndpoint) {
+        Log.info("TCP dial starting: \(endpoint)")
         let options = NWProtocolTCP.Options()
         options.noDelay = true   // latency matters more than throughput here
         // No interface steering: macOS already ranks a Thunderbolt Bridge or
@@ -1919,9 +1934,17 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             self.scheduleReconnect()
         }
         conn.stateUpdateHandler = { [weak self] state in
-            guard let self else { return }
+            guard let self, self.connection === conn else { return }
             switch state {
             case .ready:
+                conn.requestEstablishmentReport(queue: self.queue) { report in
+                    guard let report else { return }
+                    let resolution = report.resolutions.map {
+                        "\($0.source):\(Int($0.duration * 1000))ms"
+                    }.joined(separator: ",")
+                    Log.info("TCP established: \(Int(report.duration * 1000))ms "
+                        + "DNS=[\(resolution)] proxy=\(report.usedProxy)")
+                }
                 self.becomeReady(conn)
             case .failed(let error):
                 Log.info("connection failed: \(error)")

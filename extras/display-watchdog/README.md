@@ -1,5 +1,9 @@
 # Portable physical displays for the external watchdog
 
+For sender1.23.0 and newer, use the app's
+[native display control](../../FORK-ALFHEIM.md#sender-1230-native-display-ownership)
+and stop the external watchdog. This compatibility repair is for older senders.
+
 This fixes a deployment script, not the OpenDisplay app. Updating only the app
 bundle will not replace a separately installed `opendisplay-watchdog`.
 
@@ -14,6 +18,7 @@ display timeout was still enabled. Some monitors also do not support BetterDispl
 Use the local desktop, end the remote session first, and leave a physical display
 connected. The Mac must already have the external watchdog and its display helpers.
 This patch preserves its existing receiver, virtual-display and network settings.
+It upgrades both the original watchdog and the earlier portable-display version.
 It does not install a new watchdog or configure BetterDisplay.
 
 From a reviewed checkout of the `alfheim` branch:
@@ -48,9 +53,14 @@ restores the old behavior, including its monitor-specific limitation.
   The watchdog records the actual panels' UUIDs before hiding any of them, restores
   those panels and the original physical primary, then drops the placeholder.
   Partial failures keep the recovery record and a usable display path.
+- Physical ID/UUID requests explicitly select `deviceType=Display`. BetterDisplay
+  5.1.1 otherwise also returns its Default Group, preventing the saved-identity
+  transaction from reaching the actual disconnect. A failed `get connected` is
+  not used to infer whether native `set connected=off` works.
 - BetterDisplay connection management still requires supported hardware and its
   applicable license. Unsupported physical disconnection is reported as a topology
   failure with the panel left available; this patch does not bypass that limitation.
+  The updater does not substitute brightness, software dimming or mirroring.
 - Display classification retains the existing exclusions for the configured
   placeholder, OpenDisplay displays and AirPlay placeholders. Other third-party
   virtual-display products are outside the validated scope.

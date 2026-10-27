@@ -62,7 +62,7 @@ enum SessionLayout: String, CaseIterable, Identifiable {
     var hint: String {
         switch self {
         case .remote:
-            return "The device becomes this Mac's MAIN display: a new desktop at the origin, so windows, dialogs and the menu bar open where you are looking. The sender holds it there for the whole session and keeps no saved position for it."
+            return "The device becomes this Mac's main display. Physical monitors disconnect while the remote desktop is active and reconnect when it ends. If disconnection is unavailable, the monitors stay connected."
         case .extend:
             return "A second desktop next to the Mac's own, returned to wherever you last dragged it in System Settings → Displays. Nothing is made main."
         case .mirror:

@@ -15,12 +15,9 @@ import CoreGraphics
 // to, or the windows would be unreachable — so the desktop arrived on the
 // remote screen for free.
 //
-// This fork cannot do that. The session's own display is virtual; the
-// BetterDisplay placeholder that makes a headless Mac usable stays connected,
-// and so does the physical monitor when there is one. The Mac therefore never
-// reaches zero displays, macOS never relocates anything, and the operator is
-// left driving a main display with nothing on it while their work sits on a
-// screen they cannot see.
+// Native display control now disconnects physical panels after capture starts.
+// The recovery desktop and other virtual displays can still hold windows;
+// gathering also keeps the remote desktop usable if a panel cannot disconnect.
 //
 // So the windows are moved deliberately. The sender already holds Accessibility
 // permission — it is what injects every keystroke and every click — and the

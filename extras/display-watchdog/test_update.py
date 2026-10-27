@@ -21,9 +21,11 @@ class UpdaterTests(unittest.TestCase):
         self.updated = WATCHDOG.read_bytes()
         self.target.write_bytes(self.updated)
         self.target.chmod(0o700)
-        result = subprocess.run(["/usr/bin/patch", "-R", "-f", "-F", "0", str(self.target),
-                                 str(ROOT / "portable-displays.patch")], capture_output=True)
-        self.assertEqual(result.returncode, 0, "Tests require an already patched WATCHDOG_UNDER_TEST")
+        for patch in ["physical-display-type.patch", "portable-displays.patch"]:
+            result = subprocess.run(["/usr/bin/patch", "-R", "-f", "-F", "0", str(self.target),
+                                     str(ROOT / patch)], capture_output=True)
+            self.assertEqual(result.returncode, 0, "Tests require an already patched WATCHDOG_UNDER_TEST")
+            if patch == "physical-display-type.patch": self.previous = self.target.read_bytes()
         self.original = self.target.read_bytes()
 
     def update(self, target=None):
@@ -47,6 +49,12 @@ class UpdaterTests(unittest.TestCase):
         self.assertNotEqual(self.update().returncode, 0)
         self.assertEqual(self.target.read_bytes(), content)
         self.assertFalse(list(self.target.parent.glob(self.target.name + ".before-portable-displays-*")))
+
+    def test_previous_portable_version_is_upgraded(self):
+        self.target.write_bytes(self.previous)
+        result = self.update()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.target.read_bytes(), self.updated)
 
     def test_invalid_shell_is_refused(self):
         content = self.original + b"\nif\n"

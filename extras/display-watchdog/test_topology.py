@@ -40,12 +40,16 @@ for arg in args:
     if arg.startswith("-name="): selected = [d for d in selected if d["name"] == arg.split("=", 1)[1]]
     if arg.startswith("-deviceType="): selected = [d for d in selected if d["type"] == arg.split("=", 1)[1]]
 if args[0] == "get" and "-identifiers" in args:
-    print(",".join(json.dumps(dict(UUID=d["uuid"], displayID=d["id"] if d["on"] else "0", name=d["name"], deviceType=d["type"], registryLocation="IOService:/Test" if d["type"] == "Display" else "", vendor="1", model="2", serial="3")) for d in selected))
+    records = [dict(UUID=d["uuid"], displayID=d["id"] if d["on"] else "0", name=d["name"], deviceType=d["type"], registryLocation="IOService:/Test" if d["type"] == "Display" else "", vendor="1", model="2", serial="3") for d in selected]
+    # Observed BetterDisplay 5.1.1 response: a group is included unless type is explicit.
+    if not any(a.startswith("-deviceType=") for a in args) and any(a.startswith(("-displayID=", "-UUID=")) for a in args):
+        records.append(dict(deviceType="DisplayGroup", name="Default Group", tagID="-1001"))
+    print(",".join(json.dumps(d) for d in records))
     sys.exit(0)
 if len(selected) != 1: sys.exit(1)
 d = selected[0]
 if args[0] == "get" and "-connected" in args:
-    if not d.get("manageable", True): sys.exit(1)
+    if not d.get("queryManageable", d.get("manageable", True)): sys.exit(1)
     print("on" if d["on"] else "off")
 elif args[0] == "set":
     for arg in args:
@@ -186,6 +190,16 @@ exit "$result"
         self.assertTrue(self.state["virtual"]["on"])
         self.assertEqual(self.awake.read_text().strip(), "1")
         self.assertTrue((self.root / "physical-displays").exists())
+
+    def test_native_disconnect_does_not_depend_on_connected_query(self):
+        self.state["panels"][0].update(manageable=True, queryManageable=False)
+        self.state["session"] = True
+        result = self.run_topology("headed")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(self.state["panels"][0]["on"])
+        self.state["session"] = False
+        self.assertEqual(self.run_topology("headed-session").returncode, 0)
+        self.assertTrue(self.state["panels"][0]["on"])
 
     def test_partial_disconnect_can_recover_all_original_panels(self):
         self.state["panels"] = [panel("External A", "2", True), panel("External B", "3", True)]

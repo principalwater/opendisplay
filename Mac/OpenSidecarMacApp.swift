@@ -2,6 +2,7 @@ import SwiftUI
 import Network
 import Combine
 import Sparkle
+import ServiceManagement
 
 /// How the app presents itself. One bundle, switched at runtime via the
 /// activation policy — like Raycast/Hammerspoon style background agents.
@@ -58,6 +59,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // was force-quit. Before anything else: a user who relaunches because
         // "the Mac went silent" should get their sound back immediately.
         SpeakerMuteController.shared.recoverFromPreviousRun()
+        DisplaySessionController.shared.start()
         // Hand the updater to the control window, which is built outside the
         // SwiftUI App scene (NSHostingView), so it can offer the same button.
         MainWindow.updater = updater
@@ -72,6 +74,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Ordinary quit: put the speakers back before the process goes away,
         // so the breadcrumb path never has to run.
         SpeakerMuteController.shared.releaseForShutdown()
+        DisplaySessionController.shared.shutdown()
     }
 
     // Background/Dock modes: opening the app again (Spotlight, Finder, Dock
@@ -213,6 +216,24 @@ final class SenderController: ObservableObject {
     }
 
     @Published var sessions: [DeviceSession] = []
+    @Published var displayControlStatus: String?
+    @Published var launchAtLogin = SMAppService.mainApp.status == .enabled
+    @Published var startupError: String?
+
+    func setLaunchAtLogin(_ enabled: Bool) {
+        do {
+            if enabled { try SMAppService.mainApp.register() }
+            else { try SMAppService.mainApp.unregister() }
+            launchAtLogin = SMAppService.mainApp.status == .enabled
+            startupError = SMAppService.mainApp.status == .requiresApproval
+                ? "Allow OpenDisplay in System Settings → General → Login Items."
+                : nil
+        } catch {
+            launchAtLogin = SMAppService.mainApp.status == .enabled
+            startupError = "Could not change launch at login: \(error.localizedDescription)"
+            Log.info(startupError ?? "Launch-at-login update failed")
+        }
+    }
     @Published var discovered: [NWBrowser.Result] = []
     @Published var usbDevices: [UsbmuxDevice] = []
     // `-host x.x.x.x` / `-port n` bypass usbmuxd with a manual TCP endpoint
@@ -471,6 +492,9 @@ final class SenderController: ObservableObject {
     @Published private(set) var rejections: [RejectionRow] = []
 
     init() {
+        DisplaySessionController.shared.onStatus = { [weak self] message in
+            self?.displayControlStatus = message
+        }
         startBrowsing()
         usbWatcher = UsbmuxDeviceWatcher { [weak self] devices in
             guard let self else { return }
@@ -983,6 +1007,7 @@ final class SenderController: ObservableObject {
                                identityOffset: identityOffset(for: id),
                                awaitingWake: awaitingWake)
         let session = DeviceSession(id: id, target: target, name: name, sender: sender)
+        let displayOwner = ObjectIdentifier(session)
         if case .wifi(let result) = target {
             session.wifiServiceName = serviceName(of: result)
         }
@@ -1001,6 +1026,27 @@ final class SenderController: ObservableObject {
             // just come up starts. Either way the answer changed, so ask again
             // rather than waiting for the next browse event.
             self.autoConnect()
+        }
+        sender.onDisplayPreparing = { [weak self, weak session] in
+            guard let self, let session,
+                  self.sessions.contains(where: { $0 === session }) else { return }
+            await DisplaySessionController.shared.prepare(
+                session: displayOwner, remote: session.sender.layout == .remote)
+            if !self.sessions.contains(where: { $0 === session }) {
+                DisplaySessionController.shared.end(session: displayOwner)
+            }
+        }
+        sender.onDisplayReady = { [weak self, weak session] displayID, ready in
+            guard let self, let session,
+                  self.sessions.contains(where: { $0 === session }) else { return }
+            if ready {
+                DisplaySessionController.shared.captureReady(
+                    session: displayOwner, display: displayID,
+                    remote: session.sender.layout == .remote)
+            } else {
+                DisplaySessionController.shared.captureReleased(
+                    session: displayOwner, display: displayID)
+            }
         }
         sender.onAudioDeliveryChange = { [weak self, weak session] active in
             guard let self, let session, session.audioDeliveryActive != active else { return }
@@ -1046,13 +1092,13 @@ final class SenderController: ObservableObject {
             session?.qualityLevel = level
         }
         sender.onDisconnected = { [weak self, weak session] in
-            // Device unplugged / left the network and stayed gone: end this
-            // session fully (virtual display + capture + indicator). No
-            // transport fallback — reconnecting is the user's call.
-            guard let self, let session else { return }
+            // Release the desktop during an outage; the existing dialer waits for its return.
+            guard let self, let session,
+                  self.sessions.contains(where: { $0 === session }) else { return }
+            let target = session.target
             Log.info("device disconnected — session \(session.id) stopped")
             self.end(session)
-            self.exitAfterReceiverLossIfConfigured()
+            if self.autoConnectEnabled { self.connect(to: target, awaitingWake: true) }
         }
         sender.onPeerSleeping = { [weak self, weak session] in
             // The device locked. Unlike a plain disconnect this is a
@@ -1060,11 +1106,11 @@ final class SenderController: ObservableObject {
             // the session (which frees the cursor from the now-invisible
             // display) is paired with a replacement session that dials
             // patiently until the device wakes and accepts again.
-            guard let self, let session else { return }
+            guard let self, let session,
+                  self.sessions.contains(where: { $0 === session }) else { return }
             let target = session.target
             Log.info("session \(session.id) asleep — display down, waiting for wake")
             self.end(session)
-            if self.exitAfterReceiverLossIfConfigured() { return }
             self.connect(to: target, awaitingWake: true)
         }
         sender.onCaptureStoppedByUser = { [weak self, weak session] in
@@ -1117,10 +1163,10 @@ final class SenderController: ObservableObject {
             // The receiver app quit — a deliberate goodbye, so no reconnect
             // waits around. Reopening the app is a fresh start handled by
             // the normal discovery/auto-connect paths.
-            guard let self, let session else { return }
+            guard let self, let session,
+                  self.sessions.contains(where: { $0 === session }) else { return }
             Log.info("session \(session.id) closed by the receiver — ending")
             self.end(session)
-            self.exitAfterReceiverLossIfConfigured()
         }
         sessions.append(session)
         // A dialer row is not a live stream. Host silence begins only after
@@ -1139,6 +1185,7 @@ final class SenderController: ObservableObject {
                 self.end(session)
             } catch {
                 Log.info("sender failed to start: \(error)")
+                DisplaySessionController.shared.end(session: displayOwner)
                 session.status = "Failed: \(error.localizedDescription)"
                 // Free the half-built pipeline: a leaked virtual display
                 // would keep holding this device's serial, and a parked
@@ -1178,29 +1225,20 @@ final class SenderController: ObservableObject {
     }
 
     private func end(_ session: DeviceSession) {
+        DisplaySessionController.shared.end(session: ObjectIdentifier(session))
         session.sender.stop()
         sessions.removeAll { $0.id == session.id }
         updateSpeakerMute()   // the last session leaving un-mutes the speakers
-    }
-
-    // A supervised headless Mac may need its physical display restored before
-    // accepting another receiver. Opt in on that Mac only; the supervisor
-    // relaunches this app after the display is ready.
-    @discardableResult
-    private func exitAfterReceiverLossIfConfigured() -> Bool {
-        guard sessions.isEmpty, UserDefaults.standard.bool(forKey: "exitAfterReceiverLoss") else {
-            return false
-        }
-        Log.info("exitAfterReceiverLoss — quitting after session teardown")
-        NSApp.terminate(nil)
-        return true
     }
 
     /// Layout/quality apply per-pipeline at construction — rebuild every session.
     func restartAll() {
         guard running else { return }
         let targets = sessions.map(\.target)
-        sessions.forEach { $0.sender.stop() }
+        sessions.forEach {
+            DisplaySessionController.shared.end(session: ObjectIdentifier($0))
+            $0.sender.stop()
+        }
         sessions.removeAll()
         updateSpeakerMute()
         targets.forEach { connect(to: $0) }
@@ -1435,6 +1473,11 @@ struct ContentView: View {
                     Text(controller.sessionLayout.hint)
                         .font(.caption)
                         .foregroundStyle(.secondary)
+                    if let status = controller.displayControlStatus {
+                        Text(status)
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                    }
                 }
 
                 if controller.sessionLayout == .remote {
@@ -1443,9 +1486,8 @@ struct ContentView: View {
                                isOn: $controller.gatherWindows)
                         Text("When the session starts, move the open windows from the "
                              + "other displays onto this one, and put them back when it "
-                             + "ends. Unplugging a monitor does this automatically; a "
-                             + "virtual display cannot, because the other displays are "
-                             + "still connected.")
+                             + "ends. This also gathers windows left on other virtual "
+                             + "displays or on a monitor that could not disconnect.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
@@ -1554,6 +1596,15 @@ struct ContentView: View {
                         ForEach(AppPresentation.allCases, id: \.self) { p in
                             Text(p.label).tag(p)
                         }
+                    }
+                    Toggle("Launch at login", isOn: Binding(
+                        get: { controller.launchAtLogin },
+                        set: { controller.setLaunchAtLogin($0) }
+                    ))
+                    if let error = controller.startupError {
+                        Text(error)
+                            .font(.caption)
+                            .foregroundStyle(.orange)
                     }
                     if controller.presentation == .background {
                         Text("No menu bar or Dock icon — streaming keeps running. Open the OpenDisplay app again (Spotlight/Finder) to show this window.")

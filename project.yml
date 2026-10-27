@@ -47,8 +47,22 @@ targets:
     sources:
       - Mac
       - Shared
+      - DisplayControl
     dependencies:
       - package: Sparkle
+      - target: OpenDisplayDisplayAgent
+        embed: false
+    postBuildScripts:
+      - name: Embed native display recovery agent
+        script: |
+          set -eu
+          agent="$BUILT_PRODUCTS_DIR/OpenDisplayDisplayAgent"
+          destination="$TARGET_BUILD_DIR/$EXECUTABLE_FOLDER_PATH/OpenDisplayDisplayAgent"
+          /usr/bin/ditto "$agent" "$destination"
+        inputFiles:
+          - $(BUILT_PRODUCTS_DIR)/OpenDisplayDisplayAgent
+        outputFiles:
+          - $(TARGET_BUILD_DIR)/$(EXECUTABLE_FOLDER_PATH)/OpenDisplayDisplayAgent
     info:
       path: Mac/Info.plist
       properties:
@@ -116,6 +130,24 @@ targets:
           # Colour-inverted icon so the dev build is obvious in the Dock,
           # cmd-tab and permission lists.
           ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon-Dev
+  OpenDisplayDisplayAgent:
+    type: tool
+    platform: macOS
+    deploymentTarget: "14.0"
+    sources:
+      - DisplayAgent
+      - DisplayControl
+    settings:
+      base:
+        PRODUCT_NAME: OpenDisplayDisplayAgent
+        PRODUCT_BUNDLE_IDENTIFIER: com.peetzweg.opensidecar.mac.alfheim.display-agent
+        GENERATE_INFOPLIST_FILE: YES
+        CREATE_INFOPLIST_SECTION_IN_BINARY: YES
+        INFOPLIST_KEY_LSUIElement: YES
+        INFOPLIST_KEY_LSBackgroundOnly: YES
+        SWIFT_OBJC_BRIDGING_HEADER: Mac/CGVirtualDisplayPrivate.h
+        ENABLE_HARDENED_RUNTIME: YES
+        SKIP_INSTALL: YES
   # The standalone receiver app (issues #82/#17/#241): a spare Mac as a
   # display. Deliberately its own bundle with a much lower deployment target
   # than the sender, which is pinned to 14 by its capture stack. Everything
@@ -195,6 +227,7 @@ targets:
       # state machine and the registry that owns every CGVirtualDisplay. Neither
       # touches CoreGraphics, so the release path is testable without a display.
       - Mac/DisplayLifecycle.swift
+      - DisplayControl
       - Mac/VideoSendQueue.swift
       - Shared/StatsChannel.swift
       - Mac/SessionDedupe.swift
@@ -203,6 +236,7 @@ targets:
       - Mac/SessionLayout.swift
       - Mac/WindowGather.swift
       - Shared/SenderIdentity.swift
+      - Shared/ReceiverStartupGate.swift
       # Pure, UIKit-free: the Native-mode gesture decisions (iOS), tested here.
       - iOS/NativeTouchPolicy.swift
       - MacReceiver/FullscreenPreference.swift
