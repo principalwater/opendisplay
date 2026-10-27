@@ -45,9 +45,10 @@ the sender's capture-origin pin; physical enabled-state changes stay app-scoped.
 ## Validation recorded on 2026-10-27
 
 On Apple Silicon, macOS27.0.1 and an Apple Thunderbolt Display, the hardware
-fixture passed physical disconnect, external reactivation, repeated sessions,
+fixture passed physical disconnect, external reactivation, capture replacement
+without panel wake, repeated sessions, held-capture restoration acknowledgement,
 normal end, lease EOF and an actual capture-owner SIGKILL, restoring physical
-mode and arrangement. BetterDisplay was closed. The normal suite passed836
+mode and arrangement. BetterDisplay was closed. The normal suite passed844
 XCTest cases (one existing optional skip) and four Swift Testing cases; the
 legacy topology/updater suite passed18 cases. Signed Release builds succeeded
 for a universal macOS14+ sender/helper and the iOS16.4+ receiver. Existing
@@ -56,7 +57,13 @@ unrelated compiler warnings remain.
 The manual Connect UI was checked in iPad portrait/landscape and a narrow phone
 simulator. It remained unarmed beyond80seconds, with no TCP listener; choosing
 Any Mac did not start admission. The automatic option defaulted to off.
-Real saved-host selection, streaming, physical cable hotplug, sleep/wake and
-signed sender/helper crash acceptance require the actual devices. Intel runtime
+The operator accepted signed1.23.0(13) on a real iPad: saved-host/manual Connect,
+faster connection, streaming, repeated rotation without panel wake, and correct
+panel/window return. Killing the signed agent during a real session also
+restored physical ownership while the session continued. A pending-panel fixture
+kept the journal, avoided an invisible fallback on a headed desktop and used
+less than1.5seconds of child CPU while waiting through bounded EOF recovery.
+
+Physical cable hotplug and sleep/wake still require device acceptance. Intel runtime
 and other monitor hardware have not been exercised. These observations do not
 establish sustained streaming or energy performance.
