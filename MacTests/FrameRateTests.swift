@@ -303,6 +303,17 @@ final class StreamTimingTests: XCTestCase {
         }
     }
 
+    func testTheNegotiatedRateCapsDeliveryBelowTheConfiguredRate() {
+        // A 60 fps receiver behind a 120 Hz virtual display.
+        XCTAssertEqual(StreamTiming.deliveredFrameCeiling(adaptive: nil, selected: 60, configured: 120), 60)
+        // Adaptation goes lower still; the lower of the two wins.
+        XCTAssertEqual(StreamTiming.deliveredFrameCeiling(adaptive: 30, selected: 60, configured: 120), 30)
+        // A receiver that takes the configured rate adds no cap.
+        XCTAssertNil(StreamTiming.deliveredFrameCeiling(adaptive: nil, selected: 120, configured: 120))
+        XCTAssertEqual(StreamTiming.deliveredFrameCeiling(adaptive: 30, selected: 120, configured: 120), 30)
+        XCTAssertNil(StreamTiming.deliveredFrameCeiling(adaptive: nil, selected: nil, configured: 120))
+    }
+
     func testEncoderTimingSurvivesAnUnannouncedSize() {
         // Encoded size is 0 until capture reports one.
         let timing = StreamTiming.encoder(rate: .fps120, quality: .best, width: 0, height: 0)

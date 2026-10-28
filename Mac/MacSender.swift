@@ -3742,7 +3742,10 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         // drops are — a frame that is not going to help is work not spent, and
         // a pre-encode skip leaves the H.264 reference chain intact (n → n+2 is
         // a normal P-frame), so nothing has to be re-keyed.
-        if let cap = deliveredFrameCap {
+        if let cap = StreamTiming.deliveredFrameCeiling(
+            adaptive: deliveredFrameCap,
+            selected: activeStreamConfigurationSnapshot?.framesPerSecond,
+            configured: frameRate.rawValue) {
             let now = CACurrentMediaTime()
             // A hair under the interval: the capture clock and this one beat
             // against each other, and rejecting a frame that is 0.1 ms early
