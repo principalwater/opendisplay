@@ -23,12 +23,19 @@ two overlap. Taken from upstream, ported onto the fork's pipeline:
   `defaults write com.peetzweg.opensidecar.mac.alfheim videoCodec h264` keeps
   H.264 from the next session on; `hevc` drops the frame-rate condition; with
   the key unset the choice is automatic.
+- The stream follows the receiver's presentation rate: receivers from this
+  branch announce their panel's maximum, so a 60 Hz panel gets 60 fps and a
+  ProMotion iPad 120, and the sender never delivers more frames than it
+  negotiated.
 - The arrangement-restore window starts on its first tick (#392); a capture
   that delivers another display re-attaches (#393); a display-unit clash
   renumbers the session display in creation order (#399, Extend only).
 - The sender can shut down a Mac receiver on a direct cable (#332); macOS may
-  ask once to let the receiver control the login window. A Mac receiver whose
-  direct cable is plugged in connects by itself (#338).
+  ask once to let the receiver control the login window. The receiver accepts
+  the request only on a wired path whose addresses are all link-local, never
+  over Wi-Fi or a tailnet; a router-less shared Ethernet segment would also
+  qualify. A Mac receiver whose direct cable is plugged in connects by itself
+  (#338); a Disconnect while cabled holds until it is connected by hand.
 - Android over USB in accessory mode, without adb (#225, #404, #424). Plugging
   in connects only a device that streamed over the cable before.
 
