@@ -131,4 +131,118 @@ final class DisplayArrangementTests: XCTestCase {
 
         XCTAssertEqual(target, CGPoint(x: -933, y: 345))
     }
+
+    // MARK: - Extend never makes the session display main
+    //
+    // Hardware test C, 2026-10-28, macOS 27.2: a 1.22.7 record (0,0,1194,834)
+    // put the Extend display at the desktop origin, which is what makes a
+    // display main, and the panel moved aside. WindowServer also restored its
+    // own Remote arrangement for the pair, with the panel at 2560 × 1440.
+
+    private let panel = CGRect(x: 0, y: 0, width: 2_048, height: 1_152)
+    private let iPad = CGSize(width: 1_194, height: 834)
+
+    private func restoredRemoteArrangement() -> [OriginPin.Screen] {
+        [OriginPin.Screen(id: 8, size: iPad, origin: .zero),
+         OriginPin.Screen(id: 2, size: CGSize(width: 2_560, height: 1_440),
+                          origin: CGPoint(x: 1_194, y: 0))]
+    }
+
+    func testStaleRecordAtTheDesktopOriginIsNeitherRestoredNorSaved() {
+        let stale = [0, 0, 1_194, 834]
+
+        XCTAssertNil(DisplayArrangement.origin(for: iPad, record: stale,
+                                               relativeTo: panel, against: [panel]))
+        XCTAssertNil(DisplayArrangement.origin(for: CGSize(width: 834, height: 1_194),
+                                               record: stale, relativeTo: panel, against: [panel]),
+                     "a rotation must not remap it beside the panel either")
+        XCTAssertNil(DisplayArrangement.record(for: CGRect(origin: .zero, size: iPad),
+                                               relativeTo: panel, preferring: nil))
+    }
+
+    func testPlacementOverTheDesktopOriginIsInvalidButTouchingItIsNot() {
+        let over = CGRect(x: -600, y: -400, width: 1_194, height: 834)
+
+        XCTAssertNil(DisplayArrangement.record(for: over, relativeTo: panel, preferring: .left))
+        XCTAssertNil(DisplayArrangement.origin(for: iPad, record: [-600, -400, 1_194, 834],
+                                               relativeTo: panel, against: [panel]))
+        // A corner or an edge at the origin is a neighbour, not an overlap.
+        XCTAssertTrue(DisplayArrangement.isValid(CGRect(x: -1_194, y: -834,
+                                                        width: 1_194, height: 834)))
+        XCTAssertTrue(DisplayArrangement.isValid(CGRect(x: 0, y: -834, width: 1_194, height: 834)))
+    }
+
+    func testMissingRecordGoesRightOfTheMainDisplay() {
+        XCTAssertNil(DisplayArrangement.origin(for: iPad, record: nil,
+                                               relativeTo: panel, against: [panel]))
+        XCTAssertEqual(DisplayArrangement.defaultOrigin(rightOf: panel), CGPoint(x: 2_048, y: 0))
+    }
+
+    func testValidLeftRecordIsSavedAndRestoredOnTheLeft() {
+        // The record the sender wrote once the user had dragged the iPad left.
+        let left = CGRect(x: -1_194, y: 0, width: 1_194, height: 834)
+        let record = DisplayArrangement.record(for: left, relativeTo: panel, preferring: nil)
+
+        XCTAssertEqual(record, [-1_194, 0, 1_194, 834, DisplayArrangement.Side.left.rawValue])
+        XCTAssertEqual(DisplayArrangement.origin(for: iPad, record: record,
+                                                 relativeTo: panel, against: [panel]),
+                       left.origin)
+    }
+
+    func testValidRightRecordIsSavedAndRestoredOnTheRight() {
+        let right = CGRect(x: 2_048, y: 0, width: 1_194, height: 834)
+        let record = DisplayArrangement.record(for: right, relativeTo: panel, preferring: nil)
+
+        XCTAssertEqual(record, [2_048, 0, 1_194, 834, DisplayArrangement.Side.right.rawValue])
+        XCTAssertEqual(DisplayArrangement.origin(for: iPad, record: record,
+                                                 relativeTo: panel, against: [panel]),
+                       right.origin)
+    }
+
+    func testGuardPutsThePanelBackAndAMissingRecordRightOfIt() {
+        let target = CGRect(origin: DisplayArrangement.defaultOrigin(rightOf: panel), size: iPad)
+
+        let placements = DisplayArrangement.mainRestoringLayout(
+            main: 2, mainBefore: panel, session: 8, target: target,
+            screens: restoredRemoteArrangement())
+
+        XCTAssertEqual(placements, [
+            OriginPin.Placement(id: 8, origin: CGPoint(x: 2_560, y: 0)),
+            OriginPin.Placement(id: 2, origin: .zero),
+        ], "right of the panel at its size now, not at the 2048 it had before the restore")
+    }
+
+    func testGuardKeepsASavedLeftSpot() {
+        let target = CGRect(x: -1_194, y: 0, width: 1_194, height: 834)
+
+        let placements = DisplayArrangement.mainRestoringLayout(
+            main: 2, mainBefore: panel, session: 8, target: target,
+            screens: restoredRemoteArrangement())
+
+        XCTAssertEqual(placements, [
+            OriginPin.Placement(id: 8, origin: CGPoint(x: -1_194, y: 0)),
+            OriginPin.Placement(id: 2, origin: .zero),
+        ])
+    }
+
+    func testGuardKeepsOtherDisplaysAtTheirOffsetFromTheMainDisplay() {
+        let third = OriginPin.Screen(id: 4, size: CGSize(width: 1_280, height: 800),
+                                     origin: CGPoint(x: 1_194 + 2_560, y: 0))
+
+        let placements = DisplayArrangement.mainRestoringLayout(
+            main: 2, mainBefore: panel, session: 8,
+            target: CGRect(x: -1_194, y: 0, width: 1_194, height: 834),
+            screens: restoredRemoteArrangement() + [third])
+
+        XCTAssertEqual(placements.last, OriginPin.Placement(id: 4, origin: CGPoint(x: 2_560, y: 0)))
+    }
+
+    func testGuardDoesNothingWithoutTheOldMainDisplay() {
+        let placements = DisplayArrangement.mainRestoringLayout(
+            main: 3, mainBefore: panel, session: 8,
+            target: CGRect(x: 2_048, y: 0, width: 1_194, height: 834),
+            screens: restoredRemoteArrangement())
+
+        XCTAssertEqual(placements, [])
+    }
 }

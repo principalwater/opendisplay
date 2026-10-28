@@ -25,9 +25,10 @@ enum CaptureMode: String {
 /// * `remote` — extend, and the sender pins its own virtual display at the
 ///   desktop origin `(0, 0)`, which is how macOS defines the main display.
 ///   Arrangement memory is **off**: nothing is restored, nothing is saved.
-/// * `extend` — upstream's behaviour, byte for byte: the arrangement memory
-///   puts the display back where the user last dragged it, and nothing is
-///   made main.
+/// * `extend` — upstream's behaviour: the arrangement memory puts the
+///   display back where the user last dragged it, and nothing is made main.
+///   The fork adds one guard: the display that was main before the session
+///   stays main (`VirtualDisplay.OriginPolicy.remembered`).
 /// * `mirror` — upstream's mirror mode: capture the main display, create no
 ///   virtual display. View-only, as it has always been.
 enum SessionLayout: String, CaseIterable, Identifiable {

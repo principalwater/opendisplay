@@ -20,13 +20,42 @@ enum DisplayArrangement {
     /// old position reads as broken; deliberate split positions are a
     /// possible opt-in, see #128).
     static func save(origin: CGPoint, size: CGSize, device: String) {
-        let rect = CGRect(origin: origin, size: size)
-        let previousSide = load(device)?.side
         let main = CGDisplayBounds(CGMainDisplayID())
-        let side = side(of: rect, relativeTo: main, preferring: previousSide)
-        var record = [Int(origin.x), Int(origin.y), Int(size.width), Int(size.height)]
-        if let side { record.append(side.rawValue) }
+        guard let record = record(for: CGRect(origin: origin, size: size), relativeTo: main,
+                                  preferring: load(device)?.side) else {
+            Log.info("display arrangement: not saving (\(Int(origin.x)),\(Int(origin.y))) for "
+                + "\(device) — at the desktop origin the display is main, not beside it")
+            return
+        }
         UserDefaults.standard.set(record, forKey: key(device))
+    }
+
+    /// Pure core of `save`: the stored record, or nil for a placement
+    /// `isValid` rejects.
+    static func record(for placement: CGRect, relativeTo main: CGRect,
+                       preferring previousSide: Side?) -> [Int]? {
+        guard isValid(placement) else { return nil }
+        var record = [Int(placement.minX), Int(placement.minY),
+                      Int(placement.width), Int(placement.height)]
+        if let side = side(of: placement, relativeTo: main, preferring: previousSide) {
+            record.append(side.rawValue)
+        }
+        return record
+    }
+
+    /// Whether a placement may be restored or saved. One at or over the
+    /// desktop origin is a record of the session display being *main*, not
+    /// of a spot beside the main display: older senders wrote them in Remote,
+    /// and restoring one is what made the iPad main in Extend on 2026-10-28
+    /// (a 1.22.7 record `(0,0,1194,834)`).
+    static func isValid(_ placement: CGRect) -> Bool {
+        !placement.contains(OriginPin.mainOrigin)
+    }
+
+    /// Extend's spot for a display with no valid record: right of the main
+    /// display, top edges aligned.
+    static func defaultOrigin(rightOf main: CGRect) -> CGPoint {
+        CGPoint(x: main.maxX, y: main.minY)
     }
 
     /// Where a new display of `size` points should go: the saved spot
@@ -37,19 +66,62 @@ enum DisplayArrangement {
     /// overlap; WindowServer then snaps it, and the snap becomes the next
     /// saved position (#203).
     ///
-    /// Nil on first contact — let macOS choose.
+    /// Nil on first contact and for a record `isValid` rejects.
     static func origin(for size: CGSize, device: String) -> CGPoint? {
-        guard let placement = load(device) else { return nil }
-        if placement.rect.size == size { return placement.rect.origin }
-        let main = CGDisplayBounds(CGMainDisplayID())
-        // Records from before #203 did not store a side. If one already
-        // touches the main display, infer it now so an otherwise clean
-        // existing arrangement also gains the stable behavior on rotation.
-        if let side = placement.side ?? side(of: placement.rect, relativeTo: main, preferring: nil) {
-            return origin(for: size, from: placement.rect, side: side,
-                          relativeTo: main)
+        let record = UserDefaults.standard.array(forKey: key(device)) as? [Int]
+        if let rect = placement(from: record)?.rect, !isValid(rect) {
+            Log.info("display arrangement: ignoring the saved placement (\(Int(rect.minX)),"
+                + "\(Int(rect.minY)) \(Int(rect.width))x\(Int(rect.height))) for \(device) "
+                + "— it is at the desktop origin, so restoring it would make the display main")
         }
-        return remappedOrigin(from: placement.rect, to: size, against: activeDisplayBounds())
+        return origin(for: size, record: record, relativeTo: CGDisplayBounds(CGMainDisplayID()),
+                      against: activeDisplayBounds())
+    }
+
+    /// Pure core of `origin(for:device:)`. `record` is the stored array;
+    /// `displays` are as in `remappedOrigin`.
+    static func origin(for size: CGSize, record: [Int]?, relativeTo main: CGRect,
+                       against displays: [CGRect]) -> CGPoint? {
+        guard let placement = placement(from: record), isValid(placement.rect) else { return nil }
+        let origin: CGPoint
+        if placement.rect.size == size {
+            origin = placement.rect.origin
+        } else if let side = placement.side
+                    ?? side(of: placement.rect, relativeTo: main, preferring: nil) {
+            // Records from before #203 did not store a side. If one already
+            // touches the main display, infer it now so an otherwise clean
+            // existing arrangement also gains the stable behavior on rotation.
+            origin = self.origin(for: size, from: placement.rect, side: side, relativeTo: main)
+        } else {
+            origin = remappedOrigin(from: placement.rect, to: size, against: displays)
+        }
+        return isValid(CGRect(origin: origin, size: size)) ? origin : nil
+    }
+
+    /// Extend's repair once another display has become main (2026-10-28):
+    /// `main` back at the desktop origin, every other display at its current
+    /// offset from it, and the session display on the side of `main` its
+    /// `target` was on. The side is measured against `main`'s size now,
+    /// because the same macOS restore can change the main display's mode
+    /// (the panel came back at 2560 × 1440 instead of 2048 × 1152).
+    /// `target` is in the coordinates of `mainBefore`, the main display's
+    /// bounds when the target was chosen. One transaction for the reason in
+    /// `OriginPin.layout`; empty when either display is not in `screens`.
+    static func mainRestoringLayout(main: UInt32, mainBefore: CGRect, session: UInt32,
+                                    target: CGRect,
+                                    screens: [OriginPin.Screen]) -> [OriginPin.Placement] {
+        guard let mainNow = screens.first(where: { $0.id == main }),
+              let sessionNow = screens.first(where: { $0.id == session }) else { return [] }
+        let mainAtOrigin = CGRect(origin: OriginPin.mainOrigin, size: mainNow.size)
+        let sessionOrigin = side(of: target, relativeTo: mainBefore, preferring: nil)
+            .map { origin(for: sessionNow.size, from: target, side: $0, relativeTo: mainAtOrigin) }
+            ?? target.origin
+        return screens.map { screen in
+            OriginPin.Placement(id: screen.id, origin: screen.id == session
+                ? sessionOrigin
+                : CGPoint(x: screen.origin.x - mainNow.origin.x,
+                          y: screen.origin.y - mainNow.origin.y))
+        }
     }
 
     /// The user-visible slot a virtual display occupies relative to the main
@@ -122,8 +194,11 @@ enum DisplayArrangement {
     }
 
     private static func load(_ device: String) -> Placement? {
-        guard let record = UserDefaults.standard.array(forKey: key(device)) as? [Int],
-              record.count == 4 || record.count == 5 else { return nil }
+        placement(from: UserDefaults.standard.array(forKey: key(device)) as? [Int])
+    }
+
+    private static func placement(from record: [Int]?) -> Placement? {
+        guard let record, record.count == 4 || record.count == 5 else { return nil }
         let rect = CGRect(x: CGFloat(record[0]), y: CGFloat(record[1]),
                           width: CGFloat(record[2]), height: CGFloat(record[3]))
         return Placement(rect: rect, side: record.count == 5 ? Side(rawValue: record[4]) : nil)

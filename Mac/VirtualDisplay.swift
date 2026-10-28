@@ -28,6 +28,13 @@ final class VirtualDisplay {
         /// asynchronously restores *its* stale arrangement for a fresh
         /// identity), then report every later move so the caller can persist
         /// the user's drag. `SessionLayout.extend`.
+        ///
+        /// Nil `restore` means right of the main display, never "let macOS
+        /// choose": WindowServer keeps one arrangement per set of displays,
+        /// and this identity is shared with Remote, so macOS's choice can be
+        /// a Remote arrangement with this display at the origin. Whatever
+        /// the restore does, the display that was main stays main — see
+        /// `keepMainDisplay`.
         case remembered(restore: CGPoint?, onChange: ((CGPoint, CGSize) -> Void)?)
         /// Hold the display at the desktop origin `(0,0)` — which is what
         /// makes a display the **main** display on macOS — for the whole
@@ -57,6 +64,12 @@ final class VirtualDisplay {
     private var restoreUntil: Date
     private var lastReportedOrigin: CGPoint?
     private let onOriginChange: ((CGPoint, CGSize) -> Void)?
+    /// `.remembered` only: the display that was main before this one was
+    /// created or resized, its bounds then, and where this display was meant
+    /// to go beside it. See `keepMainDisplay`.
+    private var mainGuard: (display: CGDirectDisplayID, bounds: CGRect, target: CGRect)?
+    private var mainGuardUntil = Date.distantPast
+    private var mainGuardRepairs = 0
 
     /// The enforcement loop's own state machine (`Mac/DisplayLifecycle.swift`).
     /// Main-thread confined, like everything else below.
@@ -98,8 +111,15 @@ final class VirtualDisplay {
         let onOriginChange: ((CGPoint, CGSize) -> Void)?
         switch originPolicy {
         case .remembered(let restore, let onChange):
-            restoreOrigin = restore
+            // Read before the display exists, so it is never this display.
+            let main = CGMainDisplayID()
+            let mainBounds = CGDisplayBounds(main)
+            let target = restore ?? DisplayArrangement.defaultOrigin(rightOf: mainBounds)
+            restoreOrigin = target
             onOriginChange = onChange
+            let size = CGSize(width: pointsWide, height: pointsHigh)
+            mainGuard = (main, mainBounds, CGRect(origin: target, size: size))
+            mainGuardUntil = Date().addingTimeInterval(6)
         case .pinnedToMain:
             restoreOrigin = nil
             onOriginChange = nil
@@ -306,6 +326,8 @@ final class VirtualDisplay {
         // Same helper as the initial apply: a rotation must not quietly drop
         // the panel back to 60 Hz.
         newSettings.modes = [Self.mode(pointsWide: pointsWide, pointsHigh: pointsHigh, targetFPS: targetFPS)]
+        let mainBefore = CGMainDisplayID()
+        let mainBeforeBounds = CGDisplayBounds(mainBefore)
         guard display.apply(newSettings) else {
             Log.info("virtual display \(id) applySettings FAILED during resize")
             return false
@@ -322,6 +344,16 @@ final class VirtualDisplay {
             Log.info("virtual display \(id) resized to \(pointsWide)x\(pointsHigh)pt")
             pinToMainOrigin()
             return true
+        }
+        // The same restore that can follow the mode change (below) must not
+        // take the main display either. If this display already is main, the
+        // user made it so in System Settings, and that is theirs to keep.
+        if mainBefore != id {
+            let target = origin ?? DisplayArrangement.defaultOrigin(rightOf: mainBeforeBounds)
+            let size = CGSize(width: pointsWide, height: pointsHigh)
+            mainGuard = (mainBefore, mainBeforeBounds, CGRect(origin: target, size: size))
+            mainGuardUntil = Date().addingTimeInterval(6)
+            mainGuardRepairs = 0
         }
         if let origin {
             var config: CGDisplayConfigRef?
@@ -491,6 +523,7 @@ final class VirtualDisplay {
             return
         }
         guard display != nil else { return }
+        if keepMainDisplay() { return }
         let origin = CGDisplayBounds(id).origin
         if let target = restoreTarget, Date() < restoreUntil {
             // Initial arrangement is system state, not a user drag. Mark it
@@ -520,6 +553,55 @@ final class VirtualDisplay {
             lastReportedOrigin = origin
             onOriginChange?(origin, CGSize(width: pointsWide, height: pointsHigh))
         }
+    }
+
+    /// Extend's guard: the display that was main before this one existed
+    /// stays main. On 2026-10-28 (macOS 27.2) the first Extend session on the
+    /// operator's MacBook came up as the main display: a 1.22.7 record at
+    /// (0,0) was restored, and WindowServer, which keeps one arrangement per
+    /// set of displays, brought back the Remote arrangement for this shared
+    /// identity. Checked on every tick of macOS's restore window and once
+    /// after it; past that, another main display is the user's own choice in
+    /// System Settings, not something to fight.
+    ///
+    /// `.permanently`, unlike the Remote pin: the repaired arrangement is
+    /// what WindowServer should restore for this set of displays next time.
+    /// Bounded like the pin: after three repairs it says so and stops.
+    ///
+    /// Returns whether it reconfigured, so the tick does nothing else.
+    private func keepMainDisplay() -> Bool {
+        guard let mainGuard else { return false }
+        if Date() >= mainGuardUntil { self.mainGuard = nil }
+        let main = CGMainDisplayID()
+        guard main != mainGuard.display else { return false }
+        let moves = DisplayArrangement.mainRestoringLayout(
+            main: UInt32(mainGuard.display), mainBefore: mainGuard.bounds,
+            session: UInt32(id), target: mainGuard.target, screens: Self.arrangement())
+        // The old main display is gone, or this one is not in the arrangement.
+        guard !moves.isEmpty else { return false }
+        var config: CGDisplayConfigRef?
+        guard CGBeginDisplayConfiguration(&config) == .success else { return false }
+        for move in moves {
+            CGConfigureDisplayOrigin(config, CGDirectDisplayID(move.id),
+                                     Int32(move.origin.x), Int32(move.origin.y))
+        }
+        let err = CGCompleteDisplayConfiguration(config, .permanently)
+        // System state, not a user drag: hold it for the rest of the restore
+        // window and never report it for saving.
+        let settled = CGDisplayBounds(id).origin
+        restoreTarget = settled
+        lastReportedOrigin = settled
+        mainGuardRepairs += 1
+        Log.info("extend layout: display \(main) had become main — display \(mainGuard.display) "
+            + (CGMainDisplayID() == mainGuard.display ? "is main again" : "is still NOT main")
+            + ", display \(id) settled (\(Int(settled.x)),\(Int(settled.y))) "
+            + "(result \(err.rawValue), repair \(mainGuardRepairs) of 3)")
+        if mainGuardRepairs >= 3, self.mainGuard != nil {
+            self.mainGuard = nil
+            Log.info("extend layout: something outside this app keeps changing the main "
+                + "display — leaving it alone for the rest of the session")
+        }
+        return true
     }
 
     /// Hold the display at the desktop origin.
