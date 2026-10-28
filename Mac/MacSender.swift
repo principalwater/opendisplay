@@ -3963,6 +3963,14 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             scheduleDropReplayTimer()
             return
         }
+        // The dropped frame may be the first at a new adaptive size, which the
+        // capture callback never got to: rebuild for it here, as it would have.
+        let bufferSize = (wide: CVPixelBufferGetWidth(pixelBuffer),
+                          high: CVPixelBufferGetHeight(pixelBuffer))
+        if encoderSize != bufferSize {
+            rebuildEncoderForNewCaptureSize(bufferSize)
+            guard encoderSize == bufferSize else { return }
+        }
         lastDeliveredFrameAt = CACurrentMediaTime()   // the rate cap counts replays too
         encode(pixelBuffer, pts: CMClockGetTime(CMClockGetHostTimeClock()),
                generation: captureGenerationNow)
