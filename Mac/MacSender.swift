@@ -3492,8 +3492,15 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         case "kf":
             // The phone's decoder lost sync (e.g. it attached mid-GOP and
             // periodic keyframes are off) — force an IDR on the next frame.
-            Log.info("phone requested keyframe")
-            needsKeyframe = true
+            // Same throttle as the eviction repairs, so the two never add up
+            // to more than one IDR a second; a request inside that second is
+            // owed, not lost (`requestOwedKeyframe`).
+            if keyframeAfterDrop.shouldRequestIdr(evictedFrames: 1, at: ProcessInfo.processInfo.systemUptime) {
+                Log.info("phone requested keyframe")
+                needsKeyframe = true
+            } else {
+                Log.info("phone requested keyframe — one went out under a second ago, owing it")
+            }
         case WireMessage.sleeping:
             // The device locked and is about to close on us. Hand the
             // session to the controller right away: it tears the virtual

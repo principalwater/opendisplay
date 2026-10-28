@@ -180,6 +180,17 @@ final class VideoSendQueueTests: XCTestCase {
         XCTAssertEqual(policy.requested, 2)
     }
 
+    func testAReceiverRequestSharesTheEvictionThrottle() {
+        // The receiver asks for a keyframe when its layer cannot decode; an
+        // eviction repair a moment earlier already answers it, so the request
+        // is owed rather than a second IDR inside the same second.
+        var policy = KeyframeAfterDropPolicy()
+        XCTAssertTrue(policy.shouldRequestIdr(evictedFrames: 1, at: 0))    // eviction
+        XCTAssertFalse(policy.shouldRequestIdr(evictedFrames: 1, at: 0.3)) // receiver kf
+        XCTAssertTrue(policy.shouldRequestOwedIdr(at: 1.0))
+        XCTAssertEqual(policy.requested, 2)
+    }
+
     func testNothingIsOwedWithoutASuppressedEviction() {
         var policy = KeyframeAfterDropPolicy()
         XCTAssertFalse(policy.shouldRequestOwedIdr(at: 0))
