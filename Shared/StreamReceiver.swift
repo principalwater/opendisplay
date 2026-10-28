@@ -327,6 +327,7 @@ final class StreamReceiver: ObservableObject {
     private var photonWindow: [Double] = []
     private var loggedDisplayPath = false
     private var decodeErrorCount = 0
+    private var decodeFailureObserver: NSObjectProtocol?
     // Default OFF: A/B measurement showed the system video layer reaches
     // glass faster than our CAMetalLayer path (iOS gives AVSBDL a dedicated
     // compositor plane). Kept as an experimental toggle + for its metrics.
@@ -478,6 +479,24 @@ final class StreamReceiver: ObservableObject {
         self.maxEncodeWide = maxEncodeWide
         self.maxEncodeHigh = maxEncodeHigh
         displayLayer.videoGravity = .resizeAspect
+        // The layer reports a frame it cannot decode here and nowhere else:
+        // its status stays `.rendering`. HEVC refuses every frame after a
+        // missing reference (a frame the Mac's send queue evicted) and shows
+        // nothing until the next IDR, which never comes by itself — ask.
+        decodeFailureObserver = NotificationCenter.default.addObserver(
+            forName: .AVSampleBufferDisplayLayerFailedToDecode, object: displayLayer, queue: nil
+        ) { [weak self] note in
+            let error = note.userInfo?[AVSampleBufferDisplayLayerFailedToDecodeNotificationErrorKey] as? Error
+            self?.queue.async {
+                guard let self else { return }
+                self.decodeErrorCount += 1
+                if self.decodeErrorCount % 60 == 1 {
+                    Log.info("display layer could not decode a frame "
+                             + "(\(error?.localizedDescription ?? "no error given"); \(self.decodeErrorCount) total)")
+                }
+                self.requestKeyframeIfNeeded()
+            }
+        }
     }
 
     func start(port: UInt16 = 9000) {
