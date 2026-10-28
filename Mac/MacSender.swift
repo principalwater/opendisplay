@@ -753,21 +753,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             // Legacy receivers omit the new fields and keep H.264.
             let info = try await waitForHello()
             if stopped { return }
-            let content = try await SCShareableContent.current
-            guard let display = content.displays.first else {
-                throw NSError(domain: "MacSender", code: 1,
-                              userInfo: [NSLocalizedDescriptionKey: "no displays found"])
-            }
-            // SCDisplay.width/height are POINTS. Capturing at points on a
-            // Retina panel discards half the raster before the encoder ever
-            // sees it, and no quality setting can bring it back — read the
-            // true pixel size from the active display mode.
-            let displayMode = CGDisplayCopyDisplayMode(display.displayID)
-            let pixelsW = displayMode?.pixelWidth ?? display.width
-            let pixelsH = displayMode?.pixelHeight ?? display.height
-            try await startCapture(display: display,
-                                   sourcePixelsWide: pixelsW, sourcePixelsHigh: pixelsH,
-                                   receiver: info)
+            try await startMirrorCapture(info)
 
         case .extend:
             // awaitingWake is queue-confined — read it there before surfacing.
@@ -1282,6 +1268,25 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     /// until the built display matches the latest hello, so rotations that
     /// arrive mid-rebuild aren't lost (and rapid flip-flops settle once).
     private var reconfiguring = false
+    /// Mirror captures the Mac's own display; there is no virtual display to
+    /// build, resize or release.
+    private func startMirrorCapture(_ info: PhoneInfo) async throws {
+        let content = try await SCShareableContent.current
+        guard let display = content.displays.first else {
+            throw NSError(domain: "MacSender", code: 1,
+                          userInfo: [NSLocalizedDescriptionKey: "no displays found"])
+        }
+        // SCDisplay.width/height are POINTS. Capturing at points on a
+        // Retina panel discards half the raster before the encoder ever
+        // sees it, and no quality setting can bring it back — read the
+        // true pixel size from the active display mode.
+        let displayMode = CGDisplayCopyDisplayMode(display.displayID)
+        try await startCapture(display: display,
+                               sourcePixelsWide: displayMode?.pixelWidth ?? display.width,
+                               sourcePixelsHigh: displayMode?.pixelHeight ?? display.height,
+                               receiver: info)
+    }
+
     private func reconfigure(_ info: PhoneInfo) async {
         guard !reconfiguring, !stopped else { return }
         reconfiguring = true
@@ -1307,7 +1312,12 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             encoder = nil
             needsKeyframe = true
             do {
-                if !rebuildFromScratch, try await resizeExistingDisplay(for: target) {
+                if mode == .mirror {
+                    // A new operating point for the same display (the HEVC
+                    // fallback, a receiver that changed codecs): capture it
+                    // again. The Extend paths below would build a virtual one.
+                    try await startMirrorCapture(target)
+                } else if !rebuildFromScratch, try await resizeExistingDisplay(for: target) {
                     // The display identity survived, so WindowServer has no
                     // reason to migrate this device's windows to a sibling.
                 } else {
