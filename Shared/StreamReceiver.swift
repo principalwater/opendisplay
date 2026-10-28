@@ -499,6 +499,11 @@ final class StreamReceiver: ObservableObject {
         }
     }
 
+    deinit {
+        // The Mac receiver builds a new instance each time receiver mode starts.
+        if let decodeFailureObserver { NotificationCenter.default.removeObserver(decodeFailureObserver) }
+    }
+
     func start(port: UInt16 = 9000) {
         self.port = port
         queue.async {
