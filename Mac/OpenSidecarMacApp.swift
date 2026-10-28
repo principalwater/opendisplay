@@ -675,7 +675,8 @@ final class SenderController: ObservableObject {
             cabledUDIDs: cableCoveringUDIDs,
             installIDByUDID: installIDByUDID,
             manualEndpointInstallID: manualEndpointInstallID,
-            installIDByServiceName: installIDByServiceName)
+            installIDByServiceName: installIDByServiceName,
+            optedOutServiceNames: cableOptOut)
         var seenThisPass = Set<String>()
         for decision in decisions {
             seenThisPass.insert(decision.sessionID)

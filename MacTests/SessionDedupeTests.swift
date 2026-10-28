@@ -441,6 +441,18 @@ final class SessionDedupeTests: XCTestCase {
         XCTAssertEqual(toDial([candidate("Alices iPad")]), ["wifi:Alices iPad"])
     }
 
+    func testACableOptOutHoldsForAKnownReceiver() {
+        // #338: a Disconnect while cabled holds until the user connects by
+        // hand, though the receiver is known and would otherwise be dialed.
+        let studio = candidate("Studio", serviceName: "Studio")
+        let optedOut = SessionDedupe.bonjourDecisions(
+            candidates: [studio], sessions: [], knownInstallIDs: ["install-A"],
+            cabledUDIDs: [], installIDByUDID: [:], manualEndpointInstallID: nil,
+            optedOutServiceNames: ["Studio"])
+        XCTAssertEqual(optedOut.map(\.dial), [false])
+        XCTAssertEqual(decisions([studio]).map(\.dial), [true])
+    }
+
     func testAnUnknownReceiverIsNotDialed() {
         // A flatmate opening the app on their own iPad is not consent. Those
         // still go through `wifiRemembered` and its launch window.

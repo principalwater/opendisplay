@@ -442,14 +442,16 @@ enum SessionDedupe {
                                    cabledUDIDs: Set<String>,
                                    installIDByUDID: [String: String],
                                    manualEndpointInstallID: String?,
-                                   installIDByServiceName: [String: String] = [:]) -> [String] {
+                                   installIDByServiceName: [String: String] = [:],
+                                   optedOutServiceNames: Set<String> = []) -> [String] {
         bonjourDecisions(candidates: candidates,
                          sessions: sessions,
                          knownInstallIDs: knownInstallIDs,
                          cabledUDIDs: cabledUDIDs,
                          installIDByUDID: installIDByUDID,
                          manualEndpointInstallID: manualEndpointInstallID,
-                         installIDByServiceName: installIDByServiceName)
+                         installIDByServiceName: installIDByServiceName,
+                         optedOutServiceNames: optedOutServiceNames)
             .filter(\.dial).map(\.sessionID)
     }
 
@@ -463,13 +465,16 @@ enum SessionDedupe {
     ///   and two devices could in principle share one — so it is only ever used
     ///   when the TXT is absent, and only for a name this Mac has itself seen
     ///   paired with an id.
+    /// - Parameter optedOutServiceNames: services the user disconnected while
+    ///   they were on the direct cable (#338); never dialed by this rule.
     static func bonjourDecisions(candidates: [BonjourCandidate],
                                  sessions: [SessionSnapshot],
                                  knownInstallIDs: Set<String>,
                                  cabledUDIDs: Set<String>,
                                  installIDByUDID: [String: String],
                                  manualEndpointInstallID: String?,
-                                 installIDByServiceName: [String: String] = [:])
+                                 installIDByServiceName: [String: String] = [:],
+                                 optedOutServiceNames: Set<String> = [])
         -> [BonjourDecision] {
         var dialing = Set<String>()
         var decisions: [BonjourDecision] = []
@@ -500,6 +505,12 @@ enum SessionDedupe {
                                         candidate.txtID == nil
                                         ? "no TXT id, and this service name has never been paired with a receiver this Mac knows"
                                         : "TXT id is not a receiver this Mac has connected to before"))
+                continue
+            }
+            // A Disconnect while cabled holds until the user connects by hand.
+            if let name = candidate.serviceName, optedOutServiceNames.contains(name) {
+                decisions.append(decide(candidate, id, matchedBy, false,
+                                        "the user disconnected this receiver while it was on the cable"))
                 continue
             }
             // One dial per receiver per pass, even if it advertises twice.
