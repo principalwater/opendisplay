@@ -1,4 +1,5 @@
 import SwiftUI
+import VideoToolbox
 import AVFoundation
 import UIKit
 import Combine
@@ -726,11 +727,31 @@ final class ReceiverModel: ObservableObject {
     private var initialChoiceTimer: Timer?
 
     init() {
+        // Offer HEVC wherever the hardware decodes it (A9 and later; the A8/A8X
+        // iPads stay on H.264). Panels here fit H.264's raster anyway, so HEVC
+        // buys quality per bit, which matters most over WiFi. Bounded by the
+        // panel in either orientation, so a large mirrored Mac display is
+        // scaled to what this screen can show instead of sent in full. At the
+        // screen's own rate, not upstream's 60: this fork streams 120 fps to
+        // ProMotion panels, and its sender keeps H.264 rather than trade frame
+        // rate for the codec.
+        let native = UIScreen.main.nativeBounds.size   // portrait pixels
+        let longSide = Int(max(native.width, native.height))
+        var decodesHEVC = VTIsHardwareDecodeSupported(kCMVideoCodecType_HEVC)
+        #if DEBUG
+        // The simulator has no hardware decoder; -forceHEVCOffer YES exercises
+        // the HEVC receive path there with software decode.
+        if UserDefaults.standard.bool(forKey: "forceHEVCOffer") { decodesHEVC = true }
+        #endif
+        let hevc = decodesHEVC
+            ? VideoCapability(codec: "hevc", maxWidth: longSide, maxHeight: longSide,
+                              maxFrameRate: UIScreen.main.maximumFramesPerSecond)
+            : nil
         receiver = StreamReceiver(displayLayer: AVSampleBufferDisplayLayer(),
                                   deviceKind: deviceKind,
-                                  fallbackServiceName: UIDevice.current.name)
+                                  fallbackServiceName: UIDevice.current.name,
+                                  hevcCapability: hevc)
         // Announce the native panel size to the Mac.
-        let native = UIScreen.main.nativeBounds.size   // portrait pixels
         receiver.setNativePanel(long: Int(max(native.width, native.height)),
                                 short: Int(min(native.width, native.height)),
                                 scale: Double(UIScreen.main.nativeScale))

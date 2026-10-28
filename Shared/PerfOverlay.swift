@@ -21,11 +21,31 @@ struct PerfOverlay: View {
                     .font(.system(size: 12, weight: .bold, design: .monospaced))
                     .padding(.horizontal, 8)
                     .padding(.vertical, 3)
-                    .background(stats.transport == "USB" ? Color.green.opacity(0.35)
+                    .background(stats.transport == "USB" || stats.transport == "Cable"
+                                    ? Color.green.opacity(0.35)
                                 : stats.transport == "WiFi" ? Color.blue.opacity(0.4)
                                 : Color.gray.opacity(0.3),
                                 in: Capsule())
                     .foregroundStyle(.white)
+                if !stats.codec.isEmpty {
+                    Text(stats.codec)
+                        .font(.system(size: 12, weight: .bold, design: .monospaced))
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 3)
+                        .background(Color.white.opacity(0.15), in: Capsule())
+                        .foregroundStyle(.white)
+                }
+                // Frame rate is the number people know; lead with it.
+                VStack(spacing: 1) {
+                    Text("\(stats.fps)")
+                        .font(.system(size: 22, weight: .bold, design: .monospaced))
+                        .foregroundStyle(stats.fps >= 50 ? Color.green
+                                         : stats.fps >= 28 ? Color.yellow : Color.orange)
+                    Text("FPS")
+                        .font(.system(size: 8, weight: .semibold, design: .monospaced))
+                        .foregroundStyle(.white.opacity(0.6))
+                }
+                metric("hitches", "\(stats.hitches)")
 
                 if stats.e2eP50 > 0 {
                     metric("latency", String(format: "%.0f ms", stats.e2eP50))
@@ -45,22 +65,7 @@ struct PerfOverlay: View {
                     // the render+capture wait and one e2e on top.
                     metric("input", String(format: "%.0f ms", stats.inputP50))
                 }
-                if stats.audioE2eP50 > 0 {
-                    metric("audio", String(format: "%.0f ms", stats.audioE2eP50))
-                    // The sync number: audio latency minus video latency.
-                    // Signed, because which one leads matters — a viewer
-                    // tolerates sound slightly late far better than early.
-                    metric("A/V skew", String(format: "%+.0f ms", stats.avSkewMs))
-                    metric("buffer", "\(stats.audioDepth)/\(stats.audioTarget)")
-                    if stats.audioUnderruns > 0 {
-                        metric("a-under", "\(stats.audioUnderruns)")
-                    }
-                    if stats.audioDrops > 0 {
-                        metric("a↓", "\(stats.audioDrops)")
-                    }
-                }
                 metric("rtt", String(format: "%.0f ms", stats.rttMs))
-                metric("FPS", "\(stats.fps)")
                 if stats.capFps > 0 {
                     metric("Mac cap", "\(stats.capFps)")
                 }
@@ -104,7 +109,7 @@ struct PerfOverlay: View {
         graph("latency ms (cap→display)",
               BarGraph(samples: stats.e2eSamples, ceiling: 80,
                        good: 25, warn: 40, reference: nil))
-        graph("frame interval ms",
+        graph("frame interval ms (line = 60 fps)",
               BarGraph(samples: stats.samples, ceiling: 60,
                        good: 25, warn: 50, reference: 16.7))
     }

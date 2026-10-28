@@ -212,6 +212,7 @@ targets:
       - Mac/InputSource.swift
       - Mac/KeyRepeat.swift
       - Mac/OriginRestore.swift
+      - Mac/StreamConfiguration.swift
       - Mac/CaptureSourceCheck.swift
       - Mac/AndroidUSBFunction.swift
       - Mac/Log.swift
