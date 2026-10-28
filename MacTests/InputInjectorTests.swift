@@ -211,4 +211,34 @@ final class InputInjectorTests: XCTestCase {
     func testAccessibilityPermissionCheck() {
         _ = InputInjector.ensureAccessibilityPermission(prompt: false)
     }
+
+    // 2026-10-28, macOS 27.2: Mirror captured the main display but built no
+    // injector, so every session logged `injector display 0 … MISMATCH` and
+    // the iPad's touches and keys did nothing.
+    func testMirrorCaptureWithoutAnInjectorGetsOneForTheCapturedDisplay() {
+        let main = CGMainDisplayID()
+
+        XCTAssertEqual(InputInjector.forCapture(of: main, reusing: nil).targetDisplayID, main)
+    }
+
+    func testCaptureKeepsAnInjectorAlreadyAimedAtItsDisplay() {
+        // A capture re-attach must not drop the buttons and keys held now.
+        let existing = InputInjector(displayID: CGMainDisplayID(), sink: RecordingEventSink())
+        existing.handleTouch(phase: "began", x: 0.5, y: 0.5)
+
+        let injector = InputInjector.forCapture(of: CGMainDisplayID(), reusing: existing)
+
+        XCTAssertTrue(injector === existing)
+        XCTAssertTrue(injector.isDown)
+    }
+
+    func testCaptureOfAnotherDisplayGetsAFreshInjector() {
+        let existing = InputInjector(displayID: CGMainDisplayID(), sink: RecordingEventSink())
+        let other = CGMainDisplayID() &+ 1
+
+        let injector = InputInjector.forCapture(of: other, reusing: existing)
+
+        XCTAssertFalse(injector === existing)
+        XCTAssertEqual(injector.targetDisplayID, other)
+    }
 }

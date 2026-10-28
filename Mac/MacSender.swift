@@ -1209,6 +1209,9 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 
     private func startCapture(display: SCDisplay, pixelsWide: Int, pixelsHigh: Int) async throws {
+        let current = inputInjector
+        let injector = InputInjector.forCapture(of: display.displayID, reusing: current)
+        if injector !== current { replaceInputInjector(injector) }
         let filter = SCContentFilter(display: display, excludingWindows: [])
         noteEncodedSize(pixelsWide: pixelsWide, pixelsHigh: pixelsHigh)
 
@@ -1288,10 +1291,10 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             + "localCursor=\(localCursor)")
         // The geometry every injected touch is normalized against, printed
         // once per capture so an offset can be diagnosed from the log rather
-        // than guessed at. `injectorDisplay` MUST equal `display` — the
-        // injector is rebuilt with the new id on every path that changes it
-        // (`setupExtend`, `resizeExistingDisplay`), and the cursor channel
-        // normalizes against `captureDisplayID`, i.e. the same display.
+        // than guessed at. `injectorDisplay` MUST equal `display` — the top of
+        // this function makes it so on every path (`InputInjector.forCapture`),
+        // and the cursor channel normalizes against `captureDisplayID`, i.e.
+        // the same display.
         let injectorID = inputInjector?.targetDisplayID ?? 0
         let bounds = CGDisplayBounds(display.displayID)
         Log.info("input target: injector display \(injectorID) "

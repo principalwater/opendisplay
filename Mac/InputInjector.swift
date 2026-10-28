@@ -329,6 +329,21 @@ final class InputInjector {
     /// assert it equals the display that is actually being captured — a
     /// mismatch is exactly the bug class "the tap landed on the neighbour".
     var targetDisplayID: CGDirectDisplayID { displayID }
+
+    /// The injector a capture of `display` needs: `current` when it already
+    /// targets that display, because a fresh one would drop the buttons and
+    /// keys it holds; otherwise a new one for `display`. Every capture goes
+    /// through this, so input follows the captured display on every path.
+    /// Mirror builds no virtual display, and until 2026-10-28 it built no
+    /// injector either: each Mirror session logged `injector display 0 …
+    /// MISMATCH`, and the iPad's touches and keys did nothing (upstream #110;
+    /// PR #278 by raiseCatError makes the same fix).
+    static func forCapture(of display: CGDirectDisplayID,
+                           reusing current: InputInjector?) -> InputInjector {
+        if let current, current.targetDisplayID == display { return current }
+        return InputInjector(displayID: display)
+    }
+
     /// Diagnostics throttles, one per kind so a busy hover cannot starve the
     /// touch line (or the reverse). Guarded by `stateLock` like every other
     /// mutable field.
