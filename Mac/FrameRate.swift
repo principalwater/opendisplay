@@ -199,13 +199,13 @@ enum StreamTiming {
     }
 
     /// The rate the capture callback lets through to the encoder, or nil for
-    /// all of them. The adaptive cap, and also the negotiated rate when it is
-    /// below the configured one: the virtual display composites at the
-    /// configured rate and capture asks for twice the cap, so a receiver that
-    /// negotiated 60 (an upstream Linux or Android one) would otherwise get
-    /// every 120 Hz frame.
-    static func deliveredFrameCeiling(adaptive: Int?, selected: Int?, configured: Int) -> Int? {
-        let negotiated = selected.flatMap { $0 < configured ? $0 : nil }
+    /// all of them: the adaptive cap, and the negotiated rate when the source
+    /// composites faster than that (a 120 Hz virtual display or a ProMotion
+    /// panel in Mirror). Capture asks ScreenCaptureKit for twice the rate, so
+    /// a receiver that negotiated 60 would otherwise get every 120 Hz frame.
+    /// A source no faster than the stream needs no gate, and gets none.
+    static func deliveredFrameCeiling(adaptive: Int?, selected: Int?, sourceRate: Int) -> Int? {
+        let negotiated = selected.flatMap { $0 < sourceRate ? $0 : nil }
         return [adaptive, negotiated].compactMap { $0 }.min()
     }
 

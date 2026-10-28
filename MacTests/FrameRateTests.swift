@@ -303,15 +303,16 @@ final class StreamTimingTests: XCTestCase {
         }
     }
 
-    func testTheNegotiatedRateCapsDeliveryBelowTheConfiguredRate() {
-        // A 60 fps receiver behind a 120 Hz virtual display.
-        XCTAssertEqual(StreamTiming.deliveredFrameCeiling(adaptive: nil, selected: 60, configured: 120), 60)
+    func testTheNegotiatedRateCapsDeliveryFromAFasterSource() {
+        // A 60 fps receiver behind a 120 Hz virtual display, or a 60 fps
+        // Mirror stream from a ProMotion panel.
+        XCTAssertEqual(StreamTiming.deliveredFrameCeiling(adaptive: nil, selected: 60, sourceRate: 120), 60)
         // Adaptation goes lower still; the lower of the two wins.
-        XCTAssertEqual(StreamTiming.deliveredFrameCeiling(adaptive: 30, selected: 60, configured: 120), 30)
-        // A receiver that takes the configured rate adds no cap.
-        XCTAssertNil(StreamTiming.deliveredFrameCeiling(adaptive: nil, selected: 120, configured: 120))
-        XCTAssertEqual(StreamTiming.deliveredFrameCeiling(adaptive: 30, selected: 120, configured: 120), 30)
-        XCTAssertNil(StreamTiming.deliveredFrameCeiling(adaptive: nil, selected: nil, configured: 120))
+        XCTAssertEqual(StreamTiming.deliveredFrameCeiling(adaptive: 30, selected: 60, sourceRate: 120), 30)
+        // A source no faster than the stream needs no gate.
+        XCTAssertNil(StreamTiming.deliveredFrameCeiling(adaptive: nil, selected: 120, sourceRate: 120))
+        XCTAssertEqual(StreamTiming.deliveredFrameCeiling(adaptive: 30, selected: 120, sourceRate: 120), 30)
+        XCTAssertNil(StreamTiming.deliveredFrameCeiling(adaptive: nil, selected: nil, sourceRate: 120))
     }
 
     func testEncoderTimingSurvivesAnUnannouncedSize() {

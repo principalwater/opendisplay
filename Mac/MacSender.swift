@@ -3746,16 +3746,27 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         // drops are — a frame that is not going to help is work not spent, and
         // a pre-encode skip leaves the H.264 reference chain intact (n → n+2 is
         // a normal P-frame), so nothing has to be re-keyed.
+        // Extend's virtual display composites at the configured rate; a
+        // mirrored panel may be ProMotion whatever the stream rate is.
         if let cap = StreamTiming.deliveredFrameCeiling(
             adaptive: deliveredFrameCap,
             selected: activeStreamConfigurationSnapshot?.framesPerSecond,
-            configured: frameRate.rawValue) {
+            sourceRate: mode == .mirror ? max(frameRate.rawValue, 120) : frameRate.rawValue) {
             let now = CACurrentMediaTime()
+            let interval = 1.0 / Double(max(cap, 1))
+            let since = now - lastDeliveredFrameAt
             // A hair under the interval: the capture clock and this one beat
             // against each other, and rejecting a frame that is 0.1 ms early
             // would halve the delivered rate rather than cap it.
-            if now - lastDeliveredFrameAt < (1.0 / Double(max(cap, 1))) * 0.95 { return }
+            if since < interval * 0.95 {
+                // Screen capture sends nothing more once the picture stops
+                // changing, so the newest frame is replayed at the next slot
+                // the cap allows; a later frame that gets there first wins.
+                scheduleDropReplayTimer(afterMs: Int(((interval - since) * 1000).rounded(.up)))
+                return
+            }
             lastDeliveredFrameAt = now
+            cancelDropReplayTimer()   // this frame is the newest picture
         }
         if shouldDropFrame(reason: "pending_encode") { return }  // encoder busy
         // There is deliberately NO send-queue gate here any more. Round 8
@@ -3918,10 +3929,10 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 
     /// Schedule (or reset) a one-shot replay of `lastPixelBuffer` after drops.
-    private func scheduleDropReplayTimer() {
+    private func scheduleDropReplayTimer(afterMs delay: Int? = nil) {
         dropReplayTimer?.cancel()
         let timer = DispatchSource.makeTimerSource(queue: queue)
-        let replayDelayMs = max(15, 1000 / frameRate.rawValue)
+        let replayDelayMs = delay.map { max(1, $0) } ?? max(15, 1000 / frameRate.rawValue)
         timer.schedule(deadline: .now() + .milliseconds(replayDelayMs))
         timer.setEventHandler { [weak self] in
             guard let self else { return }
@@ -3944,6 +3955,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             scheduleDropReplayTimer()
             return
         }
+        lastDeliveredFrameAt = CACurrentMediaTime()   // the rate cap counts replays too
         encode(pixelBuffer, pts: CMClockGetTime(CMClockGetHostTimeClock()),
                generation: captureGenerationNow)
     }
