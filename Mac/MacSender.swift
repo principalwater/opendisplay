@@ -1280,6 +1280,10 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     /// build, resize or release.
     private func startMirrorCapture(_ info: PhoneInfo) async throws {
         let content = try await SCShareableContent.current
+        // A Disconnect while that answered tore the session down; a capture
+        // built now would outlive it. `startCapture` has no await before it
+        // creates the encoder and the stream, so this is the last window.
+        guard !stopped else { return }
         guard let display = content.displays.first else {
             throw NSError(domain: "MacSender", code: 1,
                           userInfo: [NSLocalizedDescriptionKey: "no displays found"])
