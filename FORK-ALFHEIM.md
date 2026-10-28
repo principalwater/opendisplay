@@ -30,11 +30,14 @@ two overlap. Taken from upstream, ported onto the fork's pipeline:
 - The arrangement-restore window starts on its first tick (#392); a capture
   that delivers another display re-attaches (#393); a display-unit clash
   renumbers the session display in creation order (#399, Extend only).
-- The sender can shut down a Mac receiver on a direct cable (#332); macOS may
-  ask once to let the receiver control the login window. The receiver accepts
-  the request only on a wired path whose addresses are all link-local, never
-  over Wi-Fi or a tailnet; a router-less shared Ethernet segment would also
-  qualify. A Mac receiver whose direct cable is plugged in connects by itself
+- The sender can shut down a Mac receiver on a direct cable (#332). Off by
+  default in this fork: enable it on the receiver Mac with `defaults write
+  com.peetzweg.opensidecar.mac.receiver allowPowerActions -bool true` and
+  restart the receiver; macOS may then ask once to let it control the login
+  window. The receiver accepts the request only on a wired path whose
+  addresses are all link-local, never over Wi-Fi or a tailnet; a router-less
+  shared Ethernet segment would also qualify, and nothing authenticates the
+  sender. A Mac receiver whose direct cable is plugged in connects by itself
   (#338); a Disconnect while cabled holds until it is connected by hand.
 - Android over USB in accessory mode, without adb (#225, #404, #424). Plugging
   in connects only a device that streamed over the cable before.
