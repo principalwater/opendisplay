@@ -131,6 +131,12 @@ struct VideoSendQueue<Item> {
 /// frame: the cure would deepen the very queue it is recovering from. One per
 /// second is fast enough that no user watches a smear, and slow enough that the
 /// spikes are a rounding error on the budget.
+///
+/// A suppressed eviction is owed its IDR, not forgiven: there are no periodic
+/// keyframes, so a chain broken after the last request would stay broken for
+/// the rest of the session. H.264 decoders hide that as a smear; an HEVC
+/// AVSampleBufferDisplayLayer refuses every later frame ("Cannot Decode") and
+/// the receiver's picture freezes.
 struct KeyframeAfterDropPolicy: Equatable {
 
     static let minimumIntervalSeconds = 1.0
@@ -138,6 +144,8 @@ struct KeyframeAfterDropPolicy: Equatable {
     private var lastRequestedAt: TimeInterval?
     private(set) var requested = 0
     private(set) var suppressed = 0
+    /// An eviction the throttle suppressed, still waiting for its IDR.
+    private(set) var owed = false
 
     init() {}
 
@@ -145,14 +153,29 @@ struct KeyframeAfterDropPolicy: Equatable {
         guard evictedFrames > 0 else { return false }
         if let last = lastRequestedAt, now - last < Self.minimumIntervalSeconds {
             suppressed += 1
+            owed = true
             return false
         }
+        grant(at: now)
+        return true
+    }
+
+    /// The owed IDR, as soon as the interval allows it. Asked on every sent
+    /// frame and by the sender's watchdog, so a static screen gets it too.
+    mutating func shouldRequestOwedIdr(at now: TimeInterval) -> Bool {
+        guard owed, let last = lastRequestedAt, now - last >= Self.minimumIntervalSeconds else { return false }
+        grant(at: now)
+        return true
+    }
+
+    private mutating func grant(at now: TimeInterval) {
         lastRequestedAt = now
         requested += 1
-        return true
+        owed = false
     }
 
     mutating func reset() {
         lastRequestedAt = nil
+        owed = false
     }
 }

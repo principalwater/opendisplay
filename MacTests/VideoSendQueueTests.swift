@@ -165,6 +165,38 @@ final class VideoSendQueueTests: XCTestCase {
         XCTAssertEqual(policy.requested, 2)
     }
 
+    func testAThrottledEvictionIsStillOwedItsKeyframe() {
+        // The HEVC freeze of 2026-10-29: six evictions in the first second,
+        // one IDR, then silence. The later evictions broke the chain again and
+        // no keyframe ever followed.
+        var policy = KeyframeAfterDropPolicy()
+        XCTAssertTrue(policy.shouldRequestIdr(evictedFrames: 1, at: 0))
+        XCTAssertFalse(policy.shouldRequestIdr(evictedFrames: 1, at: 0.4))
+        XCTAssertTrue(policy.owed)
+        XCTAssertFalse(policy.shouldRequestOwedIdr(at: 0.9), "still inside the throttle interval")
+        XCTAssertTrue(policy.shouldRequestOwedIdr(at: 1.0))
+        XCTAssertFalse(policy.owed)
+        XCTAssertFalse(policy.shouldRequestOwedIdr(at: 5), "one owed keyframe, paid once")
+        XCTAssertEqual(policy.requested, 2)
+    }
+
+    func testNothingIsOwedWithoutASuppressedEviction() {
+        var policy = KeyframeAfterDropPolicy()
+        XCTAssertFalse(policy.shouldRequestOwedIdr(at: 0))
+        XCTAssertTrue(policy.shouldRequestIdr(evictedFrames: 1, at: 0))
+        XCTAssertFalse(policy.shouldRequestOwedIdr(at: 2))
+        XCTAssertEqual(policy.requested, 1)
+    }
+
+    func testAnOwedKeyframeDoesNotSurviveANewConnection() {
+        var policy = KeyframeAfterDropPolicy()
+        XCTAssertTrue(policy.shouldRequestIdr(evictedFrames: 1, at: 0))
+        XCTAssertFalse(policy.shouldRequestIdr(evictedFrames: 1, at: 0.5))
+        policy.reset()
+        XCTAssertFalse(policy.owed)
+        XCTAssertFalse(policy.shouldRequestOwedIdr(at: 2))
+    }
+
     func testANewConnectionMayHaveItsKeyframeStraightAway() {
         var policy = KeyframeAfterDropPolicy()
         XCTAssertTrue(policy.shouldRequestIdr(evictedFrames: 1, at: 100))

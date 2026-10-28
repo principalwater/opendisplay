@@ -2558,6 +2558,8 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                Date().timeIntervalSince(since) > self.disconnectGraceSeconds {
                 self.reportGone("device gone for >\(Int(self.disconnectGraceSeconds))s — ending session")
             }
+            // A static screen sends nothing, so the owed IDR is asked here too.
+            if self.connectionReady { self.requestOwedKeyframe() }
             // A reconnect on a static screen produces no capture frames, so
             // the receiver would stay black — replay the last frame as IDR.
             if self.connectionReady, self.needsKeyframe,
@@ -4362,6 +4364,8 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                                                   at: ProcessInfo.processInfo.systemUptime) {
                 needsKeyframe = true
             }
+        } else {
+            requestOwedKeyframe()
         }
         publishSendQueueDepth()
         pumpSendQueue(connection)
@@ -4412,6 +4416,14 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         pipelineLock.lock()
         sendQueueDepthPublished = sendQueue.depth
         pipelineLock.unlock()
+    }
+
+    /// On `queue`: an eviction the IDR throttle suppressed is repaired once it
+    /// allows — see `KeyframeAfterDropPolicy`.
+    private func requestOwedKeyframe() {
+        guard keyframeAfterDrop.shouldRequestOwedIdr(at: ProcessInfo.processInfo.systemUptime) else { return }
+        Log.info("keyframe owed to a throttled eviction — requesting it now")
+        needsKeyframe = true
     }
 
     /// A new connection inherits nothing: the frames queued for the old socket
