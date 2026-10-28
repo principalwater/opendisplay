@@ -1,13 +1,59 @@
 # OpenDisplay Alfheim fork
 
 This branch contains the source used by a Mac sender and an iPad receiver in a
-personal remote-desktop setup. It is based on upstream OpenDisplay v1.22.0 and
-keeps the upstream GPL-3.0 license and attribution. Signed macOS packages are
+personal remote-desktop setup. It is based on upstream OpenDisplay v1.30.0,
+less the upstream changes listed under the integration below, and keeps the
+upstream GPL-3.0 license and attribution. Signed macOS packages are
 published separately in GitHub Releases, but a release may lag this branch;
 build the branch for the latest fixes. Host-specific configuration,
 credentials, and development logs are not included in this branch.
 
 ## Added behavior
+
+### Upstream v1.30.0 integration
+
+Upstream `main` at v1.30.0 (`374cee0`) is merged; fork behavior wins where the
+two overlap. Taken from upstream, ported onto the fork's pipeline:
+
+- HEVC when both ends handle it in hardware (#325). The sender picks HEVC only
+  if it keeps the frame rate H.264 would reach. Receivers from this branch offer
+  HEVC at the panel's maximum rate (120 Hz on a ProMotion iPad), and the sender
+  ignores the 60 fps H.264 limit that protocol 4 receivers advertise but never
+  enforce. Bitrate, adaptive quality and the 120 Hz rate stay the fork's.
+  `defaults write com.peetzweg.opensidecar.mac.alfheim videoCodec h264` keeps
+  H.264 from the next session on; `hevc` drops the frame-rate condition; with
+  the key unset the choice is automatic.
+- The arrangement-restore window starts on its first tick (#392); a capture
+  that delivers another display re-attaches (#393); a display-unit clash
+  renumbers the session display in creation order (#399, Extend only).
+- The sender can shut down a Mac receiver on a direct cable (#332); macOS may
+  ask once to let the receiver control the login window. A Mac receiver whose
+  direct cable is plugged in connects by itself (#338).
+- Android over USB in accessory mode, without adb (#225, #404, #424). Plugging
+  in connects only a device that streamed over the cable before.
+
+Left out: the sleep and lock recovery rewrite (#320), receiver-driven desktop
+sizing from `hello.panel` (#345) with #323, #346, #347 and #352 that build on
+it, the asynchronous resize and window reporting (#357), the Retry-only session
+button (#335), and the iOS idle screen, rating prompt and About links (#350).
+The fork's own sleep handling, native desktop sizing, resize and rotation path,
+Reconnect button and Connect UI remain. The sender ignores the new `hello`
+fields it does not use. `PROTOCOL.md` keeps upstream's 6.6 (power) and 6.7
+(panel); the fork's "Choosing a sender" is now 6.8.
+
+A 1.23.0 receiver offers only H.264 and still works with this sender; a
+receiver from this branch also works with a 1.23.0 sender.
+
+### Extend and Mirror display fixes
+
+Extend records the main display before it creates the session display and
+makes it main again after creation and through the arrangement-restore window,
+so the iPad display never becomes main. The session display goes on its
+remembered side, or to the right of the main display when no valid placement
+is remembered. A placement at or over the main display's origin is never
+restored or saved. Remote still pins its display as main; Mirror keeps its
+arrangement. Mirror sessions now create an input injector for the captured
+display, so touches and keys reach it.
 
 ### Sender 1.23.0: native display ownership
 
