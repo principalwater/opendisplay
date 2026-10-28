@@ -3335,6 +3335,12 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                 if let continuation = helloContinuation {
                     helloContinuation = nil
                     continuation.resume(returning: info)
+                } else if mode == .mirror, stream != nil, !peerAcceptsActiveCodec {
+                    // A reconnect reached a receiver that does not decode the
+                    // running codec (an H.264-only build at the same address):
+                    // every frame would be gated forever. Select again for it.
+                    Log.info("receiver no longer accepts the active codec — reselecting the Mirror stream")
+                    Task { await self.reconfigure(info) }
                 } else if mode == .extend, stream != nil, let previous,
                           streamSelectionInputsChanged(from: previous, to: info) {
                     // Phone rotated (or its limits changed) — rebuild after a
