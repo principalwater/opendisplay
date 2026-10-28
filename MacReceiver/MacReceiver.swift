@@ -42,6 +42,27 @@ final class ReceiverController: ObservableObject {
 
     private var fallbackName: String { Host.current().localizedName ?? "Mac" }
 
+    /// The sender asked this Mac to power off (PROTOCOL.md 6.6). Say
+    /// "closing" first, so the sender ends the session instead of redialing
+    /// a Mac that is going away.
+    private func perform(_ action: PowerAction) {
+        guard let receiver else { return }
+        Log.info("power \(action.rawValue): saying goodbye to the sender")
+        switch action {
+        case .shutdown:
+            receiver.shutDown {
+                DispatchQueue.main.async {
+                    PowerControl.perform(.shutdown)
+                    // An app with unsaved changes can cancel the shutdown:
+                    // take the listener back so this Mac is a display again.
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 60) { [weak self] in
+                        self?.receiver?.ensureListening()
+                    }
+                }
+            }
+        }
+    }
+
     func start() {
         guard receiver == nil else { return }
         // Legacy senders understand only this rectangle; new senders also
@@ -65,6 +86,8 @@ final class ReceiverController: ObservableObject {
         let saved = UserDefaults.standard.string(forKey: "receiverName")
         receiver.serviceName = (saved?.isEmpty == false) ? saved! : fallbackName
         announcePanel(to: receiver)
+        receiver.powerActions = PowerControl.supported
+        receiver.onPowerAction = { [weak self] action in self?.perform(action) }
         self.receiver = receiver
         receiver.start(port: 9000)
 

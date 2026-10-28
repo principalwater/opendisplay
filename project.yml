@@ -173,6 +173,7 @@ targets:
         CFBundleShortVersionString: "$(MARKETING_VERSION)"
         CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
         NSLocalNetworkUsageDescription: OpenDisplay Receiver advertises itself on the local network so another Mac can connect and use this Mac as a display.
+        NSAppleEventsUsageDescription: OpenDisplay Receiver shuts this Mac down when the connected Mac asks it to.
         NSBonjourServices: ["_opensidecar._tcp"]
         LSApplicationCategoryType: public.app-category.utilities
         # Own Sparkle feed (separate DMG, same signing key); published by
