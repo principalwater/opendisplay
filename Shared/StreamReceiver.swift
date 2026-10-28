@@ -1462,6 +1462,9 @@ final class StreamReceiver: ObservableObject {
             "device": deviceKind,
             "id": Self.installID,
             "pv": WireProtocol.version,   // issue #132 — absent on old receivers
+            // Presentation ceiling (PROTOCOL.md 6.5): a 60 Hz panel gets a
+            // 60 fps stream, and HEVC is not refused for not reaching 120.
+            "displayMaxFrameRate": displayMaxFrameRate,
             "admissionAck": true,  // sender waits for `admitted` before creating a display
             // Additive capability (PROTOCOL.md 6.1): this receiver understands
             // `AudioPacket`'s optional sequence number and counts duplicates
