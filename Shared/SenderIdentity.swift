@@ -118,7 +118,7 @@ enum SenderChoice {
     }
 }
 
-/// The `rejected` control message (PROTOCOL.md 6.6): receiver → sender,
+/// The `rejected` control message (PROTOCOL.md 6.8): receiver → sender,
 /// "not you, try again later".
 ///
 /// Additive, like everything else this fork put on the wire: a sender that does

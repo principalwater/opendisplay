@@ -66,16 +66,21 @@ over USB (dial a tunneled port), and one code path serves both transports.
   coalescing them reads as input lag.
 * A receiver serves **one sender at a time**. When a new inbound connection
   arrives while one is active, the receiver MUST adopt the new connection
-  and drop the old one (the official receiver cancels the old connection
-  and resets its decoder state).
+  and drop the old one once the newcomer proves itself with bytes: it
+  greets the newcomer with a provisional `hello` (without `cursorPort`),
+  keeps serving the live sender, and switches when the newcomer's first
+  bytes arrive, handing those bytes to the new session. A newcomer that
+  closes or stays silent is dropped and the live session is untouched; it
+  may be the loser of a sender's dial race or a probe (6.4). Adopting
+  cancels the old connection, resets decoder state and sends the full
+  `hello`.
 
 ## 2. Transport bindings
 
 The core protocol is transport-agnostic beyond "a TCP byte stream to port
-9000 on the receiver". How the sender finds that port is a *binding*. Two
-bindings exist today; ports to other platforms MAY define their own (for
-example an Android receiver reachable over `adb reverse`) without touching
-anything else in this document.
+9000 on the receiver". How the sender finds that port is a *binding*. Three
+bindings exist today; ports to other platforms MAY define their own without
+touching anything else in this document.
 
 ### 2.1 WiFi / LAN (Bonjour)
 
@@ -107,6 +112,53 @@ and the protocol proceeds exactly as over WiFi.
 Bonjour plays no role on this path. The official receiver classifies a
 connection arriving from loopback as "USB" purely for its stats display;
 this has no protocol significance.
+
+### 2.3 USB (Android devices)
+
+Android has no usbmuxd. The official sender reaches an Android receiver on
+the cable through Android Open Accessory (AOA), which works on any Android
+device with no developer settings. The byte stream is exactly the one
+described in this document, and the receiver opens it with `hello`.
+
+These control requests are vendor requests, and devices other than Android
+may act on them: a USB Ethernet chip common in docks drops its network link
+on `GET_PROTOCOL`. So a sender MUST NOT ask a device that has not answered
+before unless it exposes an Android USB function: an adb interface
+(`FF/42/01`) or an interface whose name contains `MTP` (`06/01/01`, or
+`FF/FF/00` on older kernels). A stall during discovery is final for that
+attachment.
+
+The sender sends the Android Open Accessory control requests
+(`GET_PROTOCOL` 51, `SEND_STRING` 52, `START` 53) with this identity:
+
+| Index | String | Note |
+|---|---|---|
+| 0 manufacturer | `OpenDisplay` | MUST match the receiver's `accessory_filter.xml` |
+| 1 model | `OpenDisplay Receiver` | MUST match the receiver's `accessory_filter.xml` |
+| 2 description | `Second display over USB` | |
+| 3 version | `1` | |
+| 4 URI | `https://opendisplay.app` | Offered by Android when no app matches |
+| 5 serial | `1` | |
+
+The device re-enumerates as an accessory (vendor `0x18D1`, product
+`0x2D00`, or `0x2D01` with USB debugging on) and Android launches the
+matching app, asking the user once. The accessory interface's bulk OUT/IN
+pair carries the stream, sender to receiver and back. Rules:
+
+* One attachment is one session. The receiver MUST NOT reuse an attachment
+  after its session ended: half a frame may still sit in the device's
+  buffer. The sender ends a session by resetting the device, which returns
+  it to its normal USB mode; the next session starts with a fresh
+  handshake.
+* The receiver MUST read with 16 KB buffers (the device keeps one 16 KB
+  request in flight; shorter reads can lose data) and MUST treat a
+  zero-length read as a zero-length packet, not as end of stream.
+* The sender MUST follow every write whose length is a multiple of the
+  endpoint's max packet size with a zero-length packet, or the end of that
+  write waits in the device's request until more data arrives.
+* Because every dial opens the app on the device, a receiver leaving the
+  foreground while the screen is on announces `closing` rather than
+  `sleeping` on this transport, so the sender does not redial it.
 
 ## 3. Framing
 
@@ -144,7 +196,7 @@ At `pv >= 4` the body carries an explicit type byte (section 4.1):
 All receiver-to-sender frames are JSON control messages, so the sender
 needs no demux.
 
-Sender-to-receiver frames carry both H.264 video and JSON control messages
+Sender-to-receiver frames carry both video and JSON control messages
 on the same connection. At `pv <= 3` the receiver distinguishes them
 **heuristically**. A frame is a JSON control message if and only if all
 three hold:
@@ -274,8 +326,10 @@ the compressed payload.
 
 ## 5. Video
 
-The video stream is **H.264 Annex B**, one *access unit* (one encoded
-picture) per wire frame.
+The implicit legacy video stream is **H.264 Annex B**. A sender may select
+**HEVC Annex B** only after an affirmative `hello.videoCaps` offer and must
+announce it in `streamConfig` before video. Each wire frame carries one
+*access unit* (one encoded picture).
 
 ### 5.1 Frame layout
 
@@ -295,9 +349,10 @@ picture) per wire frame.
   3-byte start codes; receivers MAY therefore split on the 4-byte pattern
   only. (A receiver that also handles 3-byte codes works today by accident;
   do not rely on it in either direction.)
-* **Keyframes carry their parameter sets.** Every IDR frame MUST be
-  prefixed with the current SPS and PPS NALUs. Non-keyframes carry only
-  slice data (plus optional SEI, which receivers MAY skip).
+* **Keyframes carry their parameter sets.** Every H.264 IDR frame MUST be
+  prefixed with SPS and PPS NALUs. Every HEVC IDR frame MUST be prefixed with
+  VPS, SPS, and PPS NALUs. Non-keyframes carry picture data (plus optional
+  SEI, which receivers MAY skip).
 * All slices of one picture MUST travel in one wire frame; receivers SHOULD
   decode each wire frame as one sample.
 * **No presentation timestamps** cross the wire. The stream is low-latency
@@ -312,7 +367,7 @@ quality presets). Receivers MUST take the video dimensions from the SPS,
 never from `hello`.
 
 When the stream changes size (device rotation, quality change), the sender
-simply starts sending frames with new SPS/PPS. Receivers MUST detect the
+simply starts sending frames with new parameter sets. Receivers MUST detect the
 parameter-set change, rebuild their decoder, and discard buffered frames
 from the old format.
 
@@ -359,7 +414,7 @@ Coordinates use the conventions of section 7.
 
 | `type` | Since | Fields | Purpose |
 |---|---|---|---|
-| `hello` | pv 1 | `pixelsWide`, `pixelsHigh`, `scale`, `device`?, `id`?, `pv`?, `audioSeq`?, `admissionAck`? | Identify the panel; (re)sent on connect and on rotation |
+| `hello` | pv 1 | `pixelsWide`, `pixelsHigh`, `scale`, `device`?, `id`?, `pv`?, `displayMaxFrameRate`?, `videoCaps`?, `panel`?, `audioSeq`?, `admissionAck`? | Identify the panel and receiver video capabilities; (re)sent on connect and whenever the panel changes |
 | `ping` | pv 1 | `t` | Liveness + clock sync probe |
 | `touch` | pv 1 | `phase`, `x`, `y`, `button`?, `t`? | Finger, trackpad and mouse button input |
 | `scroll` | pv 1 | `dx`, `dy`, `phase`? | Two-finger / trackpad / wheel scroll; `phase` is additive at pv 3 |
@@ -374,18 +429,26 @@ Coordinates use the conventions of section 7.
 | `stats` | pv 1 | free-form, `sq`? | Receiver-side telemetry for the sender's log and congestion control |
 | `sleeping` | pv 2 | none | Device locked; session ends, reconnect on wake expected |
 | `closing` | pv 2 | none | App quit; session ends for good |
-| `rejected` | pv 4 | `retryAfterMs`?, `reason`? | "Not you" — this receiver is configured for a different sender (section 6.6) |
-| `admitted` | pv 4 (additive) | none | Sender chosen; it may create the display (section 6.6) |
+| `rejected` | pv 4 | `retryAfterMs`?, `reason`? | "Not you" — this receiver is configured for a different sender (section 6.8) |
+| `admitted` | pv 4 (additive) | none | Sender chosen; it may create the display (section 6.8) |
 
 **`hello`** MUST be the first message a receiver sends on every new
 connection, because the sender sizes its virtual display from it and can do
 nothing before it arrives.
 
-* `pixelsWide`, `pixelsHigh` (int): the panel size in **physical pixels**,
-  in the panel's **current orientation** (portrait swaps them).
-* `scale` (number): the device's UI scale factor (2 or 3 on Apple
-  hardware). The sender uses it to pick a sensible point-size for the
-  virtual display.
+* `pixelsWide`, `pixelsHigh` (int): **deprecated**, superseded by `panel`
+  (section 6.7) and removed at the next `pv` bump. The desktop the receiver
+  wants, as pixels of a 2x desktop, in the **current orientation**
+  (portrait swaps them). On iOS these are the physical pixels of the
+  app's window (the whole panel when it fills the screen); the Mac
+  receiver sends its point size x 2, which is its physical pixels only on
+  a Retina panel. A sender that receives a valid `panel` ignores them.
+* `scale` (number): **deprecated** with them. The device's UI scale
+  factor (2 or 3 on Apple hardware, at least 2 from the Mac receiver).
+  Senders MUST NOT size the desktop from it; use `panel.scale`.
+* `panel` (object, optional): facts about the panel in its current
+  orientation, from which the sender decides the desktop (section 6.7).
+  Additive at `pv` 3, no bump.
 * `device` (string, optional): device kind for UI text, `"iPhone"` or
   `"iPad"` from the official receiver. Free-form.
 * `id` (string, optional): stable per-install UUID. MUST match the Bonjour
@@ -413,10 +476,13 @@ nothing before it arrives.
   `hello`, because an adopted connection may be a different receiver.
 
 A receiver MUST re-send `hello` on the live connection whenever its
-announced dimensions change (rotation). The sender rebuilds the display in
-response; the official sender debounces this by 300 ms so an orientation
-flurry settles into one rebuild, and replies to *every* `hello` with a
-fresh `welcome` (receivers treat repeats idempotently).
+announced dimensions change (rotation, a fold, a window resize). The
+sender rebuilds the display in response; the official sender rebuilds
+25 ms after a lone change (hellos within those 25 ms count as the same
+change) and, for a burst (a change within 500 ms of the previous one),
+waits until 150 ms after the last so it settles into one rebuild. It
+replies to *every* `hello` with a fresh `welcome` (receivers treat
+repeats idempotently).
 
 **`ping`** carries `t` (number): milliseconds since the Unix epoch on the
 receiver's clock. The sender MUST reply with `pong` echoing `t` (section
@@ -751,6 +817,7 @@ section 4.
 | `welcome` | pv 2 | `pv`, `min`, `host`?, `senderID`?, `statsUdp`? | Sender's side of the version handshake, plus who it is and what it reads |
 | `updateRequired` | pv 2 | `target`, `store`, `message` | Peer must update to continue |
 | `streamConfig` | pv 3 (additive) | `codec`, `width`, `height`, `framesPerSecond` | Selected video operating point |
+| `power` | pv 3 (additive) | `action` | Ask the receiver to power off (6.6) |
 
 **`pong`** echoes the `t` from the receiver's `ping` unchanged and adds
 `mt`: milliseconds since the Unix epoch on the sender's clock at the moment
@@ -933,8 +1000,8 @@ instead of a silent failure.
 
 **`streamConfig`** announces the sender's selected video configuration before
 the first video frame and again after a reconnect or stream reconfiguration.
-`codec` is a lowercase token (`"h264"` today); `width` and `height` are encoded
-pixels; `framesPerSecond` is the maximum submission rate. Receivers MUST ignore
+`codec` is a lowercase token (`"h264"` or `"hevc"`); `width` and `height` are
+encoded pixels; `framesPerSecond` is the maximum submission rate. Receivers MUST ignore
 unknown fields. A receiver that gets video without `streamConfig` MUST assume
 the legacy H.264 stream. A sender MUST NOT select a non-H.264 codec unless the
 receiver affirmatively advertised it in `videoCaps`.
@@ -956,19 +1023,30 @@ be freely combined. Unknown codecs and fields MUST be ignored. The sender
 intersects a receiver entry with its own encoder constraints and the requested
 desktop/quality policy, then reports the result with `streamConfig`.
 
-The official receiver currently advertises H.264 only. This structure makes a
-future codec additive without changing the meaning of panel dimensions or
-assuming support from a peer that merely ignored an unknown field.
+Every official receiver advertises H.264. A receiver with a hardware HEVC
+decoder also advertises HEVC: the Mac receiver up to 5120×2880 at 60 FPS, the
+iOS receiver up to its window's long side on either axis at 60 FPS, within any
+decode budget. HEVC is additive: a peer that ignores the new capability keeps
+H.264.
+
+Codec choice is the sender's, with no user setting. The official sender picks
+HEVC whenever the receiver offers it and the sender can create a hardware
+HEVC encoder at the stream size (Apple silicon today), and H.264 otherwise.
+If the HEVC encoder fails later, the sender falls back to H.264 for the rest
+of that session. On a reconnect it neither announces nor sends HEVC until the new
+connection's `hello` offers it. Receivers MUST take the codec from
+`streamConfig`, not from the bitstream.
 
 The current H.264 sender also enforces the High@L5.2 frame-size and
 macroblock-rate limits locally. For a 16:9 5K source that codec rule selects
-4096×2304 at 55 FPS; it is not a receiver-model or 5K-iMac exception. A future
-codec supplies its own encoder constraints while using the same capability
-intersection and `streamConfig` announcement.
+4096×2304 at 55 FPS; it is not a receiver-model or 5K-iMac exception. The
+HEVC raster is bounded by the receiver's HEVC entry instead, so a 5K source
+goes out at 5120×2880 when both peers offer HEVC. `framesPerSecond` stays a
+ceiling: the encoder's real throughput decides the delivered rate.
 
 `hello.maxEncodeWide` / `maxEncodeHigh` is the legacy H.264 decode ceiling:
 
-`hello.pixelsWide/High` sets the desktop size, and without further
+`hello.pixelsWide/High` sets the desired desktop size, and without further
 information it also sets the stream size — but a big panel says nothing
 about the decoder behind it. Measured end to end, H.264 hardware decode
 stops below 5120 pixels wide on every Mac tested, current models
@@ -978,16 +1056,107 @@ cleanly.
 
 Both fields are optional and additive (no `pv` bump). A receiver MAY
 advertise the largest stream, in pixels, it can actually decode at
-frame rate; a sender that understands the fields SHOULD keep the
-desktop at the announced panel size and, when the stream it would
-encode exceeds the ceiling, scale the stream down to fit inside it,
-preserving aspect. A ceiling the stream already fits inside changes
+frame rate; a sender that understands the fields SHOULD, when the
+stream it would encode exceeds the ceiling, scale the stream down to fit
+inside it, preserving aspect. The sender MAY then size the desktop to
+that stream instead of the announced panel, so capture is 1:1 and the
+picture is scaled only once, on the receiver; the reference sender does
+(#322). Receivers need no change either way: `streamConfig` announces
+the stream, and the desktop size is the sender's choice. A ceiling the stream already fits inside changes
 nothing, and a receiver that omits the fields gets the previous
 behavior (stream size follows the announced pixels and the sender's
 quality setting). Derive advertised ceilings from measured playback: a
 decode session that merely creates successfully proves nothing.
 
-### 6.6 Choosing a sender (`rejected`)
+All limits, `videoCaps` and the legacy ceiling alike, are the raster as
+presented **in the current orientation**. A receiver that rotates MUST
+re-send `hello` with its limits swapped (the Mac receiver does for a
+portrait display). A square envelope is valid in either orientation.
+
+During migration, a receiver MAY send both the legacy ceiling and
+`videoCaps`. For H.264, a sender that understands both MUST satisfy both. The
+legacy ceiling does not limit HEVC. Receiver limits do not replace sender
+validation: the sender must independently check that its encoder accepts the
+selected codec's raster and rate.
+
+### 6.6 Power actions (`hello.power`)
+
+A receiver used only as a screen often has no keyboard or mouse, so the
+sender can ask it to power off.
+
+* A receiver that can carry out power actions lists them in its `hello`:
+  `"power": ["shutdown"]`. It lists them **only on a session it would
+  obey them on**, and re-evaluates on every `hello`; absent means none.
+  Senders MUST NOT offer an action the current `hello` does not list.
+* The sender sends `{"type":"power","action":"shutdown"}`.
+* **Gate (normative).** Until the stream is authenticated, a receiver
+  MUST accept `power` only on a session that rides the direct host-to-host
+  cable, judged from its own side of the accepted connection: the path
+  uses no WiFi, cellular or loopback interface, the remote address is
+  link-local (`169.254/16` or `fe80::/10`), and the local interface
+  carrying the path holds no routable address (every Ethernet segment has
+  `fe80` addresses; only the host-to-host link has nothing else). Nothing
+  the sender sends can change this. A `power` message on any other session
+  MUST be ignored. Known gap: a switch with no DHCP server and no IPv6
+  router looks the same as the cable.
+* The message says **what**, the receiver decides **how** (the official
+  macOS receiver sends loginwindow `kAEShutDown`; a Linux receiver might
+  call `systemctl poweroff`). It powers off right away, without a
+  confirmation on the receiver; the sender confirms with its user first.
+* Before powering off, the receiver SHOULD announce `closing` (6.1) so the
+  sender ends the session instead of redialing.
+* Receivers that cannot power the device off (iOS, iPadOS) never list it.
+
+### 6.7 Panel facts (`hello.panel`)
+
+The **sender decides the size of the extended desktop**: the user's
+keyboard and mouse are on the sender, so the user's choice lives there.
+The receiver reports facts only:
+
+```json
+"panel": { "pixelsWide": 5120, "pixelsHigh": 2880, "scale": 2, "pointsWide": 2560, "pointsHigh": 1440 }
+```
+
+All values describe the panel in its **current orientation** (portrait
+swaps every pair).
+
+* `pixelsWide`, `pixelsHigh` (int, required): the **physical** pixels the
+  receiver can light up 1:1, minus any strip it never shows (the menu-bar
+  strip beside a notch). No stream needs to be larger. This is not the
+  backing store of a scaled mode: a 5K Mac at "More Space" (3200x1800
+  points) renders 6400x3600 pixels but still reports 5120x2880.
+* `scale` (number, required): the device's real backing scale: 1 on a
+  non-Retina Mac, 2 on Retina Macs and iPads, 3 on most iPhones. MAY be
+  fractional. A fact, not a request.
+* `pointsWide`, `pointsHigh` (int, optional, both or neither): the desktop
+  size the receiver itself currently runs (a Mac's "looks like" display
+  setting). Absent means the receiver has no such setting.
+
+A receiver that runs in a window smaller than its screen (iPad Split View
+or Stage Manager, one half of a foldable's split) reports that window's
+pixels, and a foldable reports the screen it is currently on.
+
+The receiver MUST re-send `hello` whenever any `panel` value changes
+(rotation, a fold or unfold, a window resize, a display-mode change on a
+Mac), even if the deprecated fields did not change.
+
+A sender uses `panel` only when `pixelsWide/High` are integers of at least
+2, `scale` is a finite number above 0, and `pointsWide/High` are both
+absent or both integers of at least 2. Otherwise it ignores the whole
+object (never part of it) and falls back to the deprecated fields. A
+malformed `panel` MUST NOT fail the `hello`.
+
+What the official sender builds from it (non-normative): a 2x desktop for
+`scale` 1.5 and above, else 1x; of `points` when present, else half the
+pixels at 2x, else the pixels at 1x. A default desktop larger than the best
+stream is shrunk to that stream so capture is 1:1 (6.5); every stream,
+mirror included, is bounded by `pixelsWide/High`. A receiver needs no
+change for any of this: `streamConfig` announces the stream.
+
+In mirror sessions `panel` only bounds the stream; the desktop is the
+sender's own display.
+
+### 6.8 Choosing a sender (`rejected`)
 
 Senders dial and receivers listen (section 1). With two senders able to
 reach one receiver — two Macs on one LAN, or on one overlay network — the
@@ -1053,8 +1222,11 @@ sender).
 
 | What | Space | Units | Origin / sign |
 |---|---|---|---|
-| `hello.pixelsWide/High` | physical panel | pixels | current orientation |
-| `hello.scale` | none | UI scale factor | n/a |
+| `hello.pixelsWide/High` (deprecated) | desired desktop | pixels of a 2x desktop | current orientation |
+| `hello.scale` (deprecated) | none | UI scale factor | n/a |
+| `hello.panel.pixelsWide/High` | physical panel | pixels | current orientation |
+| `hello.panel.pointsWide/High` | receiver's own desktop | points | current orientation |
+| `hello.panel.scale` | none | real backing scale, may be fractional | n/a |
 | `touch.x/y`, `pencil.x/y`, `proximity.x/y`, `pointer.x/y`, `zoom.x/y` | video | normalized 0..1 | top-left, x right, y down |
 | `scroll.dx/dy` | video | **pixels** (not normalized) | natural-scrolling sign |
 | `zoom.scale` | none | multiplicative factor, **incremental** (per message, not since `began`; typically 1.001–1.05) | >1 = larger |
@@ -1157,7 +1329,8 @@ Rules already stated elsewhere, gathered:
 * `hello` first, on every connection (6.1). Video starts only after it.
 * First frame after (re)connect is an IDR (5.3).
 * Rotation is a re-`hello` on the live connection, not a reconnect (6.1).
-* A new inbound connection replaces the current one (section 1).
+* A new inbound connection replaces the current one once it sends bytes
+  (section 1).
 * Silence over ~5 s is death (8.2); `sleeping`/`closing` are best-effort
   courtesies, absence of them means nothing (6.1).
 
@@ -1191,13 +1364,16 @@ Mechanics at a glance (the policy behind them lives in COMPATIBILITY.md):
 | 3 (additive) | `hello.addrs` (6.4), `hello.maxEncodeWide`/`maxEncodeHigh` (6.5); optional, no bump |
 | 3 (additive) | `touch.button`, `pointer`, `key`, `modSidebar` (6.1); optional, no bump |
 | 3 (additive) | `scroll.phase`, `zoom` (6.1); optional, no bump |
+| 3 (additive) | `hello.videoCaps`, `displayMaxFrameRate`, and `streamConfig` (6.5); legacy peers remain implicit H.264 |
+| 3 (additive) | `hello.power` and `power` (6.6); direct cable only |
+| 3 (additive) | `hello.panel` (6.7); `pixelsWide/High/scale` deprecated, removed at the next bump |
 | 4 | Typed frame header (4.1) replacing the section 4 demux heuristic; audio packets (4.2). Phase one: peers below 4 keep the heuristic |
-| 4 (additive) | `welcome.host`, `welcome.senderID`, and `rejected` (6.2, 6.6); optional, no bump |
+| 4 (additive) | `welcome.host`, `welcome.senderID`, and `rejected` (6.2, 6.8); optional, no bump |
 | 4 (additive) | `modifierSnapshot` (6.1); optional, no bump |
 | 4 (additive) | `hello.audioSeq` and the audio packet's `sequence` field (4.2, 6.1); negotiated, optional, no bump |
 | 4 (additive) | `zoom.x`/`zoom.y`, the pinch centroid (6.1); optional, no bump |
 | 4 (additive) | `welcome.statsUdp`, `stats.sq`, and `stats` on the UDP cursor flow (6.1, 6.2, 6.3); negotiated, optional, no bump |
-| 4 (additive) | `hello.admissionAck` and `admitted` (6.6); negotiated, optional, no bump |
+| 4 (additive) | `hello.admissionAck` and `admitted` (6.8); negotiated, optional, no bump |
 
 ---
 
@@ -1313,7 +1489,9 @@ recorded as hints for porters:
   `MediaCodec` + `SurfaceView`.
 * **USB from non-Mac senders:** libimobiledevice's usbmuxd implementation;
   `iproxy` demonstrates the tunnel. For non-Apple *receivers*, defining an
-  analogous binding (e.g. `adb reverse tcp:9000 tcp:9000`) is enough.
+  analogous binding (e.g. `adb forward tcp:9100 tcp:9000`, the sender dialing
+  `127.0.0.1:9100`) is enough. It must be `forward`, not `reverse`: the
+  sender dials the receiver.
 * The sender logs receiver `stats` lines prefixed `PHONE-STATS`, so one
   log file tells the whole story when debugging a session. The official
   sender appends which channel carried each one (`via udp` / `via tcp`) and
@@ -1360,8 +1538,11 @@ This file is versioned by git; the authoritative change log is
 | 2026-09-17 | Additive: `touch.button`, `pointer`, `key`, `modSidebar` (section 6.1); the release-on-disconnect rule |
 | 2026-09-17 | Additive: `pointer` `"began"`/`"ended"` phases; normative `modSidebar` reassertion after `hello`; `scroll` units pinned to the encoded stream; section 7 tables completed |
 | 2026-09-17 | Additive: `scroll.phase` and `zoom` (section 6.1), for receivers that drive scrolling as a gesture rather than as wheel clicks |
-| 2026-09-18 | Additive: `welcome.host` / `welcome.senderID` and `rejected` (sections 6.2 and 6.6), so a receiver reachable by two senders can choose between them; `zoom` gains the "report every sample" rule and a second sender-side strategy in Appendix B |
+| 2026-09-18 | Additive: `welcome.host` / `welcome.senderID` and `rejected` (sections 6.2 and 6.8), so a receiver reachable by two senders can choose between them; `zoom` gains the "report every sample" rule and a second sender-side strategy in Appendix B |
 | 2026-09-18 | Additive: `hello.audioSeq` and the audio packet's optional `sequence` field (sections 4.2 and 6.1), negotiated so an unsequenced peer receives the bytes it always did; `zoom.scale` gains the normative "the product of a gesture's increments is its total magnification" rule, the warning about recognizers whose scale-reset affordance is ignored for indirect pinches, and a per-message bound on both sides |
 | 2026-09-18 | Additive: `zoom.x` / `zoom.y`, the pinch centroid (section 6.1), because a zoom aimed at the sender's own cursor is aimed at nothing; `zoom.phase` `"cancelled"` gains the rule that a sender closes its gesture series with the platform's *ended* phase |
 | 2026-09-18 | Additive: `welcome.statsUdp` and `stats.sq`, and `stats` on the reverse direction of the UDP cursor flow (sections 6.1, 6.2, 6.3), because the report a congestion controller needs most is the one TCP delivers last; section 5.2 gains the note that the official sender now changes the encoded size mid-session, and Appendix B gains four implementer's notes on congestion control |
-| 2026-09-25 | Additive: `hello.admissionAck` and `admitted` (section 6.6), so a refused sender does not create a virtual display during the identity handshake |
+| 2026-09-25 | Additive: `hello.admissionAck` and `admitted` (section 6.8), so a refused sender does not create a virtual display during the identity handshake |
+| 2026-09-30 | Additive: `hello.power` and `power`, direct cable only (section 6.6) |
+| 2026-10-01 | Additive: `hello.panel`, the sender decides the desktop (section 6.7); limits are in the current orientation (6.5); `pixelsWide/High/scale` deprecated |
+| 2026-10-28 | Fork: upstream v1.30.0 merged; "Choosing a sender" renumbered from 6.6 to 6.8 so upstream's 6.6 (power) and 6.7 (panel) keep their numbers |

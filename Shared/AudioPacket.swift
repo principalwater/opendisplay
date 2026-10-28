@@ -22,7 +22,7 @@ import Foundation
 /// ```
 ///
 /// **The sequence number is negotiated, not assumed.** It is emitted only when
-/// the receiver asked for it in `hello.audioSeq` (PROTOCOL.md 6.7), so a peer
+/// the receiver asked for it in `hello.audioSeq` (PROTOCOL.md 6.1), so a peer
 /// that has never heard of the field receives byte-for-byte the packet it
 /// received before: bit1 clear, 15 bytes of header, payload immediately after.
 /// Inserting four bytes unconditionally would have moved the payload under
