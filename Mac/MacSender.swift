@@ -837,6 +837,13 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     /// the frame rate H.264 reaches (`hevcKeepsRate`). A failed HEVC encoder
     /// later switches this session to H.264.
     private func preferredCodec(for info: PhoneInfo, source: PixelSize) -> String {
+        // A/B checks and a way back without a rebuild: `defaults write
+        // com.peetzweg.opensidecar.mac.alfheim videoCodec h264` keeps H.264,
+        // `hevc` skips the frame-rate comparison below. Read per selection,
+        // so it applies from the next session or rebuild; unset = automatic.
+        let pinned = UserDefaults.standard.string(forKey: "videoCodec")
+        if let pinned { Log.info("videoCodec default: \(pinned)") }
+        if pinned == VideoStreamConfiguration.h264Codec { return VideoStreamConfiguration.h264Codec }
         let caps = receiverVideoCaps(for: info)
         let codec = VideoStreamConfiguration.preferredCodec(
             receiverCapabilities: caps,
@@ -852,7 +859,8 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                 requestedFramesPerSecond: frameRate.rawValue)
         }
         guard let hevc = best(codec) else { return codec }
-        guard VideoStreamConfiguration.hevcKeepsRate(hevc, comparedWith: best(VideoStreamConfiguration.h264Codec))
+        guard pinned == VideoStreamConfiguration.hevcCodec
+                || VideoStreamConfiguration.hevcKeepsRate(hevc, comparedWith: best(VideoStreamConfiguration.h264Codec))
         else { return VideoStreamConfiguration.h264Codec }
         if Self.canEncodeHEVC(hevc.encodedSize) { return codec }
         return VideoStreamConfiguration.h264Codec
