@@ -1866,6 +1866,14 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                     do { found = try await self.findSCDisplay(id: vd.displayID) }
                     catch { failure = error }
                     await MainActor.run { vd.endReconfiguration() }
+                    // A renumbering that released this display during the
+                    // lookup owns its rebuild now; a capture or a reconfigure
+                    // from here would run alongside that one (#391).
+                    guard !self.stopped else { return }
+                    guard !self.releasedForRenumbering, self.virtualDisplay === vd else {
+                        Log.info("capture re-attach abandoned — the display was released for renumbering")
+                        return
+                    }
                     do {
                         guard let display = found else { throw failure! }
                         // Capture at the display's pixel resolution (points ×2 @2x),
