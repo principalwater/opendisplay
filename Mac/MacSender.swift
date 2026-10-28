@@ -1884,6 +1884,12 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                                                     receiver: hello)
                         self.needsKeyframe = true
                     } catch {
+                        // The stream can be released for renumbering while it
+                        // starts; that rebuild owns the display then.
+                        guard !self.releasedForRenumbering, self.virtualDisplay === vd else {
+                            Log.info("re-attach failed (\(error)) after the display was released for renumbering")
+                            return
+                        }
                         Log.info("re-attach failed (\(error)) — falling back to full rebuild")
                         await self.reconfigure(hello)
                     }
