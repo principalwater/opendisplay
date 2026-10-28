@@ -60,15 +60,17 @@ final class VirtualDisplay {
     private(set) var pointsHigh: Int
     private let targetFPS: Double
 
-    private var restoreTarget: CGPoint?
-    private var restoreUntil: Date
-    private var lastReportedOrigin: CGPoint?
+    /// Arrangement restore and observation (#116); the policy, and why its
+    /// window starts on the first tick (#392), is in `OriginRestore`.
+    private var originRestore: OriginRestore
     private let onOriginChange: ((CGPoint, CGSize) -> Void)?
     /// `.remembered` only: the display that was main before this one was
     /// created or resized, its bounds then, and where this display was meant
     /// to go beside it. See `keepMainDisplay`.
     private var mainGuard: (display: CGDirectDisplayID, bounds: CGRect, target: CGRect)?
-    private var mainGuardUntil = Date.distantPast
+    /// Starts on the guard's first tick, like `OriginRestore`'s window: a
+    /// tick stalled behind a busy WindowServer must not burn it (#392).
+    private var mainGuardUntil: Date?
     private var mainGuardRepairs = 0
 
     /// The enforcement loop's own state machine (`Mac/DisplayLifecycle.swift`).
@@ -119,7 +121,6 @@ final class VirtualDisplay {
             onOriginChange = onChange
             let size = CGSize(width: pointsWide, height: pointsHigh)
             mainGuard = (main, mainBounds, CGRect(origin: target, size: size))
-            mainGuardUntil = Date().addingTimeInterval(6)
         case .pinnedToMain:
             restoreOrigin = nil
             onOriginChange = nil
@@ -128,8 +129,7 @@ final class VirtualDisplay {
         // tablet change orientation by applying a new mode to this *same*
         // virtual monitor instead of removing it and stranding its windows.
         maxPointsPerAxis = max(pointsWide, pointsHigh)
-        self.restoreTarget = restoreOrigin
-        self.restoreUntil = restoreOrigin == nil ? .distantPast : Date().addingTimeInterval(6)
+        self.originRestore = OriginRestore(target: restoreOrigin)
         self.onOriginChange = onOriginChange
 
         // Before anything can be created, make sure something will destroy it
@@ -352,7 +352,7 @@ final class VirtualDisplay {
             let target = origin ?? DisplayArrangement.defaultOrigin(rightOf: mainBeforeBounds)
             let size = CGSize(width: pointsWide, height: pointsHigh)
             mainGuard = (mainBefore, mainBeforeBounds, CGRect(origin: target, size: size))
-            mainGuardUntil = Date().addingTimeInterval(6)
+            mainGuardUntil = nil
             mainGuardRepairs = 0
         }
         if let origin {
@@ -367,9 +367,7 @@ final class VirtualDisplay {
                 // on: a snap is system state, and persisting it as if it were a
                 // user drag is the ratchet #203 is about.
                 let settled = CGDisplayBounds(id).origin
-                restoreTarget = settled
-                restoreUntil = Date().addingTimeInterval(6)
-                lastReportedOrigin = settled
+                originRestore.rearm(at: settled)
                 Log.info("virtual display \(id) resized to \(pointsWide)x\(pointsHigh)pt "
                     + "at (\(Int(origin.x)),\(Int(origin.y))), settled "
                     + "(\(Int(settled.x)),\(Int(settled.y))) (result \(err.rawValue))")
@@ -510,13 +508,12 @@ final class VirtualDisplay {
 
     // MARK: - Origin
 
-    /// Arrangement restore + observation (#116). For the first few seconds,
-    /// assert `restoreTarget`: macOS restores ITS saved arrangement for this
-    /// display identity asynchronously, seconds after creation, and that
-    /// record is stale or default whenever the identity is fresh (rotation
-    /// swaps the serial, transport switches change it) — the caller's
-    /// device-keyed record must win. Afterwards, origin changes are the user
-    /// rearranging: report them so the caller can persist the new spot.
+    /// Arrangement restore + observation (#116): enforce the caller's
+    /// device-keyed origin while macOS may still restore its own record for
+    /// this identity (stale or default whenever the identity is fresh:
+    /// rotation swaps the serial, transport switches change it), then report
+    /// user drags so the caller can persist the new spot. The policy, and why
+    /// its window starts on the first tick (#392), is in `OriginRestore`.
     private func manageOrigin() {
         if case .pinnedToMain = originPolicy {
             pinToMainOrigin()
@@ -525,33 +522,23 @@ final class VirtualDisplay {
         guard display != nil else { return }
         if keepMainDisplay() { return }
         let origin = CGDisplayBounds(id).origin
-        if let target = restoreTarget, Date() < restoreUntil {
-            // Initial arrangement is system state, not a user drag. Mark it
-            // observed so it cannot overwrite the saved device placement
-            // when the restore window expires (#203).
-            guard origin != target else {
-                lastReportedOrigin = origin
-                return
-            }
+        switch originRestore.tick(origin: origin) {
+        case .none:
+            break
+        case .apply(let target):
             var config: CGDisplayConfigRef?
             guard CGBeginDisplayConfiguration(&config) == .success else { return }
             CGConfigureDisplayOrigin(config, id, Int32(target.x), Int32(target.y))
             let err = CGCompleteDisplayConfiguration(config, .permanently)
             // WindowServer snaps the requested origin to the nearest valid
-            // arrangement — adopt what it settled on, or every remaining
-            // tick of the window would re-apply against the snap.
-            restoreTarget = CGDisplayBounds(id).origin
-            // A snap is also system state. Keep observing from the settled
-            // point, but only a later origin change may be a user drag.
-            lastReportedOrigin = restoreTarget
+            // arrangement: adopt what it settled on, as system state.
+            let settled = CGDisplayBounds(id).origin
+            originRestore.settled(at: settled)
             Log.info("display \(id) origin (\(Int(origin.x)),\(Int(origin.y))) → restored "
                 + "(\(Int(target.x)),\(Int(target.y))), settled "
-                + "(\(Int(restoreTarget!.x)),\(Int(restoreTarget!.y))) (result \(err.rawValue))")
-            return
-        }
-        if origin != lastReportedOrigin {
-            lastReportedOrigin = origin
-            onOriginChange?(origin, CGSize(width: pointsWide, height: pointsHigh))
+                + "(\(Int(settled.x)),\(Int(settled.y))) (result \(err.rawValue))")
+        case .report(let moved):
+            onOriginChange?(moved, CGSize(width: pointsWide, height: pointsHigh))
         }
     }
 
@@ -571,7 +558,10 @@ final class VirtualDisplay {
     /// Returns whether it reconfigured, so the tick does nothing else.
     private func keepMainDisplay() -> Bool {
         guard let mainGuard else { return false }
-        if Date() >= mainGuardUntil { self.mainGuard = nil }
+        let now = Date()
+        let until = mainGuardUntil ?? now.addingTimeInterval(OriginRestore.window)
+        mainGuardUntil = until
+        if now >= until { self.mainGuard = nil }
         let main = CGMainDisplayID()
         guard main != mainGuard.display else { return false }
         let moves = DisplayArrangement.mainRestoringLayout(
@@ -589,8 +579,7 @@ final class VirtualDisplay {
         // System state, not a user drag: hold it for the rest of the restore
         // window and never report it for saving.
         let settled = CGDisplayBounds(id).origin
-        restoreTarget = settled
-        lastReportedOrigin = settled
+        originRestore.settled(at: settled)
         mainGuardRepairs += 1
         Log.info("extend layout: display \(main) had become main — display \(mainGuard.display) "
             + (CGMainDisplayID() == mainGuard.display ? "is main again" : "is still NOT main")
