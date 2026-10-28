@@ -73,6 +73,7 @@ struct PhoneInfo: Decodable {
 enum SenderTransport {
     case tcp(NWEndpoint)                   // WiFi (Bonjour) or -host/-port override
     case usb(udid: String?, port: UInt16)  // native usbmuxd dial; nil = first device
+    case accessory(serial: String)         // Android over USB in accessory mode (AOA)
 }
 
 @available(macOS 14.0, *)
@@ -413,7 +414,11 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     // stays gone past the grace ends the session via onDisconnected.
     private var everConnected = false
     private var disconnectedSince: Date?
-    private let disconnectGraceSeconds: TimeInterval = 10
+    // A redial over accessory mode resets the device, waits for it twice and
+    // relaunches the app: 5-7 s on a Pixel, so it gets more room.
+    private var disconnectGraceSeconds: TimeInterval {
+        if case .accessory = transport { 20 } else { 10 }
+    }
 
     private var lastHello: PhoneInfo?
     private var helloContinuation: CheckedContinuation<PhoneInfo, Error>?
@@ -1647,6 +1652,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         encoder = nil
         cancelDropReplayTimer()
         queue.async { [weak self] in
+            self?.dialTask?.cancel()
             // Unblock a start() that is still waiting for the hello.
             self?.helloContinuation?.resume(throwing: CancellationError())
             self?.helloContinuation = nil
@@ -1672,7 +1678,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     func switchTransport(to newTransport: SenderTransport) {
         queue.async { [weak self] in
             guard let self, !self.stopped else { return }
-            let label = if case .usb = newTransport { "USB" } else { "WiFi" }
+            let label = if case .tcp = newTransport { "WiFi" } else { "USB" }
             Log.info("switching \(self.endpointName) to \(label)")
             self.transport = newTransport
             // Fresh grace window: if the new link can't come up either, the
@@ -1891,8 +1897,13 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     // MARK: - Connection (with retry)
 
     // Guards against a stale async USB dial adopting after a newer one (or a
-    // manual reconnect) superseded it. Only touched on `queue`.
-    private var dialGeneration = 0
+    // manual reconnect) superseded it. Only touched on `queue`. Superseding
+    // also cancels the dial itself: an accessory dial opens the app on the
+    // device and holds the device for up to a minute.
+    private var dialGeneration = 0 {
+        didSet { dialTask?.cancel() }
+    }
+    private var dialTask: Task<Void, Never>?
     private var bonjourDialRecovery = BonjourDialRecovery()
 
     /// A fresh Bonjour appearance supersedes a stale resolver or a sleeping redial.
@@ -1911,7 +1922,10 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         guard !stopped else { return }
         switch transport {
         case .tcp(let endpoint): connectTCP(endpoint)
-        case .usb(let udid, let port): connectUSB(udid: udid, port: port)
+        case .usb(let udid, let port):
+            connectWired { (try await Usbmux.dial(udid: udid, port: port, queue: self.queue), nil) }
+        case .accessory(let serial):
+            connectWired { try await AOA.dial(serial: serial, queue: self.queue) }
         }
     }
 
@@ -2313,18 +2327,29 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         conn.start(queue: queue)
     }
 
-    /// Dial through macOS's built-in usbmuxd — no external tunnel needed.
+    /// Dial over the cable: macOS's built-in usbmuxd for iPhones and iPads,
+    /// accessory mode for Android — no external tunnel needed. The dial may
+    /// already have read the receiver's first message (accessory mode, where
+    /// only hello proves the app opened); it is handled right after adoption.
     /// The handshake is async, so adoption is gated on `dialGeneration`.
-    private func connectUSB(udid: String?, port: UInt16) {
+    private func connectWired(_ dial: @escaping () async throws -> (NWConnection, Data?)) {
         dialGeneration += 1
         let generation = dialGeneration
-        Task { [weak self] in
+        dialTask = Task { [weak self] in
             guard let self else { return }
             do {
-                let conn = try await Usbmux.dial(udid: udid, port: port, queue: queue)
+                let (conn, firstMessage) = try await dial()
                 queue.async {
                     guard generation == self.dialGeneration, !self.stopped else {
                         conn.cancel()
+                        return
+                    }
+                    // A dial deadline can fire between the dial returning
+                    // and this block; adopting the cancelled socket would
+                    // look connected until the watchdog noticed.
+                    guard conn.state == .ready else {
+                        conn.cancel()
+                        self.scheduleReconnect()
                         return
                     }
                     self.connection = conn
@@ -2342,6 +2367,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                         }
                     }
                     self.becomeReady(conn)
+                    if let firstMessage { self.handleControl(firstMessage) }
                 }
             } catch {
                 queue.async {
@@ -2349,10 +2375,39 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                     // Distinct guidance per failure: cable missing vs app
                     // closed. Composed on `queue`: awaitingWake lives there.
                     let hint: String
-                    switch error as? Usbmux.Failure {
-                    case .noDevice:
+                    switch error {
+                    case Usbmux.Failure.noDevice:
                         hint = "Waiting for a USB device — plug in the iPhone or iPad…"
-                    case .refused:
+                    case AOA.Failure.noDevice:
+                        hint = "Waiting for the Android device — plug it in…"
+                    case AOA.Failure.notAccessory:
+                        // A locked device refuses accessory mode until unlocked.
+                        hint = self.awaitingWake
+                            ? "\(self.endpointName) is asleep — reconnects when it wakes…"
+                            : "Unlock the Android device to connect over USB…"
+                    case AOA.Failure.noApp:
+                        // Every accessory dial opens the app on the device,
+                        // so retrying a device that never answered would
+                        // keep popping a dialog: give up unless the session
+                        // already streamed (a dropped link) or waits for
+                        // the device to wake (it answers once unlocked).
+                        if self.awaitingWake {
+                            hint = "\(self.endpointName) is asleep — reconnects when it wakes…"
+                        } else if self.everConnected {
+                            self.dialRefused()
+                            hint = "Device found — open the OpenDisplay app on it…"
+                        } else {
+                            // Never answered: end like a receiver that quit, so
+                            // auto-connect leaves the device alone until it is
+                            // replugged or connected by hand.
+                            hint = "Install OpenDisplay on the Android device and allow it to use the USB accessory"
+                            if !self.goneReported, !self.stopped {
+                                self.goneReported = true
+                                Log.info("OpenDisplay did not open on the Android device — ending session")
+                                Task { @MainActor in self.onPeerClosed?() }
+                            }
+                        }
+                    case Usbmux.Failure.refused:
                         self.dialRefused()
                         hint = self.awaitingWake
                             ? "\(self.endpointName) is asleep — reconnects when it wakes…"
@@ -2536,7 +2591,10 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     /// Everything `PathClass.classify` needs that is not the round trip, read
     /// off the live connection. On `queue`, where `connection` lives.
     private func pathSignals() -> (usb: Bool, directLink: Bool, wired: Bool, tailnet: Bool) {
-        if case .usb = transport { return (true, true, true, false) }
+        switch transport {
+        case .usb, .accessory: return (true, true, true, false)
+        case .tcp: break
+        }
         var wired = false
         var host = ""
         if let path = connection?.currentPath {
