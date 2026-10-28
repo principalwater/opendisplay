@@ -422,4 +422,20 @@ final class StreamConfigurationTests: XCTestCase {
         XCTAssertTrue(VideoStreamConfiguration.hevcKeepsRate(hevc120, comparedWith: h264))
         XCTAssertTrue(VideoStreamConfiguration.hevcKeepsRate(hevc60, comparedWith: nil))
     }
+
+    func testACaptureSizeChangeKeepsTheOperatingPointRate() {
+        // The adaptive scale lever rebuilds the encoder while delivery may be
+        // capped at 30 fps; the rebuild keeps 120 (encoder latency, and the
+        // HEVC rate lever is clamped to the active rate).
+        let active = VideoStreamConfiguration(codec: "hevc",
+                                              encodedSize: PixelSize(width: 2_388, height: 1_668),
+                                              bitrate: 28_800_000, framesPerSecond: 120)
+        let smaller = PixelSize(width: 1_792, height: 1_252)
+        let rebuilt = active.resized(to: smaller)
+
+        XCTAssertEqual(rebuilt.encodedSize, smaller)
+        XCTAssertEqual(rebuilt.framesPerSecond, 120)
+        XCTAssertEqual(rebuilt.codec, "hevc")
+        XCTAssertEqual(rebuilt.bitrate, 28_800_000)
+    }
 }

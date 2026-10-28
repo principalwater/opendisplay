@@ -67,6 +67,17 @@ struct VideoStreamConfiguration: Equatable {
         return hevc.framesPerSecond >= h264.framesPerSecond
     }
 
+    /// The operating point a capture-size change rebuilds the encoder at:
+    /// same codec, bitrate ceiling and rate, new size. Never the adaptive
+    /// delivered-rate cap: ExpectedFrameRate is read once per session and a
+    /// low one slows the hardware encoder (2388x1668 at 30 fps on M2 Max:
+    /// 24 ms a frame instead of 10), and HEVC's rate lever is clamped to the
+    /// active rate, so a capped one could never climb back.
+    func resized(to size: PixelSize) -> VideoStreamConfiguration {
+        VideoStreamConfiguration(codec: codec, encodedSize: size,
+                                 bitrate: bitrate, framesPerSecond: framesPerSecond)
+    }
+
     /// `presentable` is the receiver's physical panel (PROTOCOL.md 6.7): the
     /// source is fitted inside it before the quality preset scales it, so no
     /// stream is larger than the receiver can show 1:1.

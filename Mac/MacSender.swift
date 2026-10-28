@@ -2892,15 +2892,13 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         let was = encoderSize
         if let encoder { VTCompressionSessionInvalidate(encoder) }
         encoder = nil
-        // Same codec and rate as the running operating point, at the size the
-        // capture now delivers; the codec does not change mid-stream.
-        let active = activeStreamConfigurationSnapshot
-        let configuration = VideoStreamConfiguration(
-            codec: active?.codec ?? VideoStreamConfiguration.h264Codec,
-            encodedSize: PixelSize(width: size.wide, height: size.high),
-            bitrate: active?.bitrate ?? quality.bitrate,
-            framesPerSecond: lastConfiguredCaptureFps > 0
-                ? lastConfiguredCaptureFps : (active?.framesPerSecond ?? frameRate.rawValue))
+        // The running operating point at the size the capture now delivers;
+        // codec and rate do not change mid-stream (see `resized(to:)`).
+        let newSize = PixelSize(width: size.wide, height: size.high)
+        let configuration = activeStreamConfigurationSnapshot?.resized(to: newSize)
+            ?? VideoStreamConfiguration(codec: VideoStreamConfiguration.h264Codec,
+                                        encodedSize: newSize, bitrate: quality.bitrate,
+                                        framesPerSecond: frameRate.rawValue)
         do {
             try setupEncoder(configuration)
             setActiveStreamConfiguration(configuration)
