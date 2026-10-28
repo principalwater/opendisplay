@@ -86,14 +86,7 @@ final class ReceiverController: ObservableObject {
         let saved = UserDefaults.standard.string(forKey: "receiverName")
         receiver.serviceName = (saved?.isEmpty == false) ? saved! : fallbackName
         announcePanel(to: receiver)
-        // Off unless this Mac opts in (`defaults write
-        // com.peetzweg.opensidecar.mac.receiver allowPowerActions -bool true`,
-        // then restart the receiver): nothing authenticates the sender, and the
-        // cable gate also admits a router-less wired segment.
-        let allowPower = UserDefaults.standard.bool(forKey: "allowPowerActions")
-        receiver.powerActions = allowPower ? PowerControl.supported : []
-        Log.info("power actions: " + (allowPower ? "offered on a direct cable"
-                                                  : "off (allowPowerActions is not set)"))
+        receiver.powerActions = PowerControl.supported
         receiver.onPowerAction = { [weak self] action in self?.perform(action) }
         self.receiver = receiver
         receiver.start(port: 9000)
