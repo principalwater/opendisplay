@@ -1125,6 +1125,8 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     /// Set while this sender's display is released so a sibling can take a
     /// clash-free unit number; capture recovery stays off until it is rebuilt.
     private var releasedForRenumbering = false
+    /// Set while that rebuild runs, so a second caller cannot start another.
+    private var rebuildingAfterRenumbering = false
 
     /// Create a display with `make`, keeping unit numbers unique (#391).
     ///
@@ -1209,16 +1211,22 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
 
     @MainActor
     private func rebuildDisplayAfterRenumbering() async {
-        guard releasedForRenumbering else { return }
-        // Cleared on entry: a second renumbering caller must not start a
-        // second setupExtend on the same session.
-        releasedForRenumbering = false
+        guard releasedForRenumbering, !rebuildingAfterRenumbering else { return }
+        rebuildingAfterRenumbering = true
+        // The release gate stays shut until the rebuild is over: a capture
+        // recovery tick armed before the release would otherwise start a
+        // second capture while `setupExtend` still waits for the new display.
+        defer {
+            rebuildingAfterRenumbering = false
+            releasedForRenumbering = false
+        }
         guard !stopped, let info = lastHello else { return }
         Log.info("rebuilding display after renumbering (#391)")
         do {
             try await setupExtend(info)
         } catch {
             Log.info("rebuild after renumbering failed (\(error)) — falling back to capture recovery")
+            releasedForRenumbering = false
             scheduleCaptureRecovery()
         }
     }
