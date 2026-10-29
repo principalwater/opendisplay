@@ -193,8 +193,9 @@ watchdogs, restoration timing, bundle identity and signing identity are unchange
 - A left Option/Command swap and a Control+backtick Escape binding are available
   in the Mac keyboard settings. Together they preserve Command+Option shortcuts
   and Command+backtick window switching when iPadOS delivers the key presses.
-- System audio streaming with optional host-speaker silencing tied to the
-  actual audio delivery gate.
+- System audio streaming in Remote desktop, with optional host-speaker
+  silencing tied to the actual audio delivery gate. Extend and Mirror keep the
+  sound on the Mac: nothing is captured or sent and the speakers stay on.
 - Remote, Extend, and Mirror layouts; 120 Hz default where the receiver and
   path support it; adaptive quality and congestion handling. Recognized
   tailnet sessions start conservatively and probe upward when frames flow
