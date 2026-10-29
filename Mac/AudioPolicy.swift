@@ -40,6 +40,12 @@ enum AudioPolicy {
         resolveStreamAudio(UserDefaults.standard.object(forKey: streamAudioKey))
     }
 
+    /// Whether a session in `layout` captures and sends audio: the setting
+    /// allows it and the layout sends the sound to the device.
+    static func streamsAudio(enabled: Bool, layout: SessionLayout) -> Bool {
+        enabled && layout.streamsAudio
+    }
+
     /// **Off by default**, and unlike `streamAudioKey` that polarity matches
     /// `UserDefaults.bool(forKey:)`'s own "absent is false": silencing the
     /// machine the user is sitting at is not something to do unasked.
@@ -76,6 +82,14 @@ enum AudioPolicy {
 enum AudioDeliveryPolicy {
     static func isActive(connectionReady: Bool, peerSpeaksTaggedFrames: Bool) -> Bool {
         connectionReady && peerSpeaksTaggedFrames
+    }
+
+    /// The gate for a session in `layout`: closed for good where the sound
+    /// stays on the Mac, so such a session never silences the host.
+    static func isActive(layout: SessionLayout, connectionReady: Bool,
+                         peerSpeaksTaggedFrames: Bool) -> Bool {
+        layout.streamsAudio
+            && isActive(connectionReady: connectionReady, peerSpeaksTaggedFrames: peerSpeaksTaggedFrames)
     }
 }
 

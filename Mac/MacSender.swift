@@ -281,12 +281,15 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     /// System-audio capture and encode. Nil until a session enables audio.
     /// Touched only on `audioQueue`.
     private var audioEncoder: AudioEncoder?
-    /// Whether the user wants audio streamed.
+    /// Whether this session streams audio: the user wants it and the layout
+    /// sends the sound to the device (`SessionLayout.streamsAudio`).
     ///
     /// Read-only here, and read fresh at capture setup rather than cached:
     /// SenderController owns the setting and restarts capture when it changes,
     /// so this always sees the current value and there is only ever one writer.
-    private var audioEnabled: Bool { AudioPolicy.streamAudioEnabled }
+    private var audioEnabled: Bool {
+        AudioPolicy.streamsAudio(enabled: AudioPolicy.streamAudioEnabled, layout: layout)
+    }
     /// `loggedAudioUnsupportedPeer` is audio-queue-only; `becomeReady` clears
     /// it through `audioQueue.async` rather than writing it directly.
     private var loggedAudioUnsupportedPeer = false
@@ -352,13 +355,15 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 
     private func refreshAudioGate() {
-        let open = AudioDeliveryPolicy.isActive(connectionReady: connectionReady,
+        let open = AudioDeliveryPolicy.isActive(layout: layout, connectionReady: connectionReady,
                                                 peerSpeaksTaggedFrames: peerSpeaksTaggedFrames)
             && (!admissionRequired || admissionGranted)
         audioLock.lock()
         let changed = audioGateOpen != open
         audioGateOpen = open
-        audioGateReason = admissionRequired && !admissionGranted
+        audioGateReason = !layout.streamsAudio
+            ? "layout \(layout.rawValue) keeps the sound on this Mac"
+            : admissionRequired && !admissionGranted
             ? "waiting for receiver admission"
             : Self.audioGateReason(connectionReady: connectionReady,
                                    peerSpeaksTaggedFrames: peerSpeaksTaggedFrames)
@@ -1548,6 +1553,9 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
 
         let filter = SCContentFilter(display: display, excludingWindows: [])
         let wantsAudio = audioEnabled
+        Log.info("audio: " + (wantsAudio ? "captured and sent to the device (layout \(layout.rawValue))"
+            : layout.streamsAudio ? "off in Settings — not captured"
+            : "layout \(layout.rawValue) keeps the sound on this Mac — not captured"))
         invalidateCapturePipeline(discardingLastFrame: true)
         let generation = captureGenerationNow
         do {

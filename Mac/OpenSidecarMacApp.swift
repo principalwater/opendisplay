@@ -1688,7 +1688,7 @@ struct ContentView: View {
                 VStack(alignment: .leading, spacing: 4) {
                     Toggle("Stream audio", isOn: $controller.audioEnabled)
                         .onChange(of: controller.audioEnabled) { controller.restartAll() }
-                    Text("Sends this Mac's audio to the connected device. Needs OpenDisplay 4 or newer on the receiving end; older devices keep showing the picture only.")
+                    Text("Sends this Mac's audio to the connected device in Remote desktop only; Extend and Mirror keep the sound on this Mac. Needs OpenDisplay 4 or newer on the receiving end; older devices keep showing the picture only.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
 

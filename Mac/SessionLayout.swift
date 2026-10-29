@@ -52,6 +52,12 @@ enum SessionLayout: String, CaseIterable, Identifiable {
     /// origin again), and a layout that owns `(0, 0)` has nothing to remember.
     var remembersArrangement: Bool { self == .extend }
 
+    /// Whether the Mac's sound goes to the device. Only `remote`: there the
+    /// device is the desktop and the user sits at it. In `extend` and `mirror`
+    /// the user sits at the Mac, so its speakers keep playing — no audio
+    /// capture, no audio packets, no host silence.
+    var streamsAudio: Bool { self == .remote }
+
     var label: String {
         switch self {
         case .remote: return "Remote desktop"

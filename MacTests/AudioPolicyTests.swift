@@ -269,6 +269,32 @@ struct HostAudioSilencingLifecycleTests {
                                                audioDeliveryActive: delivery))
     }
 
+    @Test("Only Remote desktop captures and sends audio",
+          arguments: [(SessionLayout.remote, true), (.extend, false), (.mirror, false)])
+    func onlyRemoteStreamsAudio(layout: SessionLayout, streams: Bool) {
+        #expect(AudioPolicy.streamsAudio(enabled: true, layout: layout) == streams)
+        #expect(AudioPolicy.streamsAudio(enabled: false, layout: layout) == false)
+    }
+
+    @Test("Extend and Mirror never open delivery, so the Mac keeps its sound",
+          arguments: [SessionLayout.extend, .mirror])
+    func extendAndMirrorNeverSilenceTheHost(layout: SessionLayout) {
+        let delivery = AudioDeliveryPolicy.isActive(layout: layout, connectionReady: true,
+                                                    peerSpeaksTaggedFrames: true)
+        #expect(delivery == false)
+        #expect(AudioPolicy.shouldMuteSpeakers(optionEnabled: true,
+                                               audioStreaming: true,
+                                               audioDeliveryActive: delivery) == false)
+    }
+
+    @Test("Remote desktop delivery still follows the receiver handshake")
+    func remoteDeliveryFollowsTheHandshake() {
+        #expect(AudioDeliveryPolicy.isActive(layout: .remote, connectionReady: true,
+                                             peerSpeaksTaggedFrames: true))
+        #expect(AudioDeliveryPolicy.isActive(layout: .remote, connectionReady: true,
+                                             peerSpeaksTaggedFrames: false) == false)
+    }
+
     @Test("Disconnect closes delivery and restores the host output")
     func disconnectClosesAudioDelivery() {
         let delivery = AudioDeliveryPolicy.isActive(connectionReady: false,
