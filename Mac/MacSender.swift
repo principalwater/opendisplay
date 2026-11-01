@@ -940,6 +940,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     /// rotates (it re-sends hello with swapped dimensions).
     private func setupExtend(_ info: PhoneInfo) async throws {
         Log.info("phone hello: \(info.pixelsWide)x\(info.pixelsHigh) @\(info.scale)x")
+        await DisplaySessionController.wakeSleepingPanel()
 
         // Phone panel is @3x; the virtual display runs @2x HiDPI, so points
         // = native pixels / 2 (rounded down to even for the encoder).
@@ -1284,6 +1285,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     /// Mirror captures the Mac's own display; there is no virtual display to
     /// build, resize or release.
     private func startMirrorCapture(_ info: PhoneInfo) async throws {
+        await DisplaySessionController.wakeSleepingPanel()
         let content = try await SCShareableContent.current
         // A Disconnect while that answered tore the session down; a capture
         // built now would outlive it. `startCapture` has no await before it
