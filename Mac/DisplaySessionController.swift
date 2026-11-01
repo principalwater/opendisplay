@@ -1,5 +1,7 @@
+import CoreGraphics
 import Darwin
 import Foundation
+import IOKit.pwr_mgt
 import Security
 
 /// Main-actor session ownership; the native child keeps recovery alive beyond this process.
@@ -124,6 +126,44 @@ final class DisplaySessionController {
         _ = self.send()
       }
     }
+  }
+
+  /// macOS refuses display configuration while a panel sleeps: the session display never settles
+  /// and the receiver waits on "Connected" with no frames. A panel is woken only if it sleeps, and
+  /// the declaration expires by itself, so its display-sleep timeout stays in charge afterwards.
+  static func wakeSleepingPanel(
+    isAsleep: () -> Bool = anyDisplayAsleep,
+    declareActivity: () -> Bool = declareBriefUserActivity,
+    pause: () async -> Void = { try? await Task.sleep(for: .milliseconds(100)) }
+  ) async {
+    guard isAsleep() else { return }
+    Log.info("sleeping panel: waking it before changing displays")
+    guard declareActivity() else {
+      Log.info("sleeping panel: could not declare user activity")
+      return
+    }
+    var polls = 0
+    while isAsleep(), polls < 50 {
+      await pause()
+      polls += 1
+    }
+  }
+
+  private nonisolated static func anyDisplayAsleep() -> Bool {
+    // Online, not active: a sleeping panel leaves the active list.
+    let online = (try? NativeDisplayBackend().online()) ?? []
+    return online.contains { CGDisplayIsAsleep($0) != 0 }
+  }
+
+  private nonisolated static func declareBriefUserActivity() -> Bool {
+    var assertion = IOPMAssertionID(0)
+    guard IOPMAssertionDeclareUserActivity("OpenDisplay session starting" as CFString,
+      kIOPMUserActiveLocal, &assertion) == kIOReturnSuccess else { return false }
+    // Left alone it would hold the panel awake for the whole display-sleep setting.
+    let timeout = IOPMAssertionSetProperty(assertion, kIOPMAssertionTimeoutKey as CFString,
+      60 as CFNumber)
+    if timeout != kIOReturnSuccess { IOPMAssertionRelease(assertion) }
+    return true
   }
 
   func captureReady(session: ObjectIdentifier, display: UInt32, remote: Bool) {

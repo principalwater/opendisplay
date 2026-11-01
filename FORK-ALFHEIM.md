@@ -117,6 +117,16 @@ relaunch the app to recover its journal, or reboot the Mac. An existing launchd
 supervisor can relaunch it after a crash. Recovery requires a logged-in desktop;
 lock screen, logout and sleep/wake have not been validated on every Mac.
 
+### Sleeping panel at session start
+
+macOS refuses display configuration while a physical panel sleeps, so a session
+would stay connected with no frames. A session now wakes a sleeping panel before
+it builds or captures a display. It does so only when a panel is asleep, with one
+user-activity declaration that macOS releases after 60 seconds, so the display-sleep
+timeout stays in charge afterwards. There is no `caffeinate` process and no recurring
+timer. Remote disconnects the panel as before; Extend and Mirror leave it on, under
+the sleep rules above.
+
 ### Receiver 1.23.0: manual connection by default
 
 The iPad receiver waits for **Connect** beside the host picker on a cold launch.
